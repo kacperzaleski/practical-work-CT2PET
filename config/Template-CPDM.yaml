@@ -1,14 +1,14 @@
 
 data:
-  dataset_name: 'CT2PET_translation' 
+  dataset_name: 'CT2PET_translation'
   dataset_type: 'custom_aligned'
   dataset_config:
-    max_pixel_ori: 32767 # PET 
+    max_pixel_ori: 32767 # PET
     max_pixel_cond: 2047 # CT
-    dataset_path: 'path/to/dataset'
-    image_size: 256
+    dataset_path: ''
+    image_size: 64
     channels: 1
-    to_normal: True 
+    to_normal: True
     flip: False
   train:
     batch_size: 16
@@ -91,7 +91,7 @@ model:
         out_ch: 1
         num_res_blocks: 1
         
-        resolution: 256
+        resolution: 64
         z_channels: 3
       embed_dim: 3
       lossconfig: 

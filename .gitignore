@@ -1,1 +1,10 @@
 /data
+CLAUDE.md
+
+# Training artifacts
+/wandb
+/checkpoints
+/results
+/logs
+/__pycache__
+**/__pycache__/

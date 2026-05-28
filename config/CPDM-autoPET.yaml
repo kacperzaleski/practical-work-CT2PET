@@ -1,0 +1,188 @@
+# CPDM: CT-to-PET Diffusion Model Configuration
+# Complete training pipeline including VQGAN, Brownian Bridge Diffusion, and UNet Attention Map
+
+data:
+  dataset_name: 'CT2PET_autoPET'
+  dataset_type: 'custom_aligned'
+  dataset_config:
+    # Data paths
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed'
+    ct_max: 3071  # HU units max value for normalization
+    pet_max: 32   # SUV max value for normalization
+    
+    # Image configuration
+    image_size: 64
+    channels: 1   # Single channel for each modality
+    target_image_size: 64
+    
+    # Normalization
+    to_normal: True  # Already normalized to [-1, 1] in preprocessing
+    flip: True       # Random horizontal flips during training
+    
+  train:
+    batch_size: 16
+    shuffle: True
+    num_workers: 4
+    prefetch_factor: 2
+    
+  val:
+    batch_size: 32
+    shuffle: False
+    num_workers: 2
+    
+  test:
+    batch_size: 32
+    shuffle: False
+    num_workers: 2
+
+model:
+  # VQGAN Configuration (Encoder/Decoder)
+  VQGAN:
+    # Model checkpoint path (set after VQGAN training)
+    ckpt_path: null
+    # VQGAN architecture parameters
+    params:
+      ddconfig:
+        attn_resolutions: []
+        ch: 128
+        ch_mult: !!python/tuple [1, 2, 4]
+        double_z: False
+        dropout: 0.0
+        in_channels: 1
+        out_ch: 1
+        num_res_blocks: 2
+        resolution: 64
+        z_channels: 4
+      
+      embed_dim: 4
+      n_embed: 8192
+      
+      lossconfig:
+        target: torch.nn.Identity
+      
+      ckpt_path: null  # Will be set during training
+
+  # Brownian Bridge Diffusion Model (Main model)
+  BB:
+    # Learning rate scheduler
+    lr_scheduler:
+      cooldown: 3000
+      factor: 0.5
+      min_lr: 5.0e-07
+      patience: 3000
+      threshold: 0.0001
+    
+    # Optimizer configuration
+    optimizer:
+      beta1: 0.9
+      lr: 0.0001
+      optimizer: Adam
+      weight_decay: 0.0
+    
+    # Model parameters
+    params:
+      UNetParams:
+        attention_resolutions: !!python/tuple [32, 16, 8]
+        channel_mult: !!python/tuple [1, 2, 3, 4]
+        condition_key: SpatialRescaler
+        context_dim: null
+        conv_resample: True
+        dims: 2
+        image_size: 64
+        in_channels: 11  # 4 (latent CT) + 4 (latent PET) + 1 (attention map) + 1 (attenuation map) + 1 (concatenation)
+        model_channels: 128
+        num_head_channels: 64
+        num_heads: 8
+        num_res_blocks: 2
+        out_channels: 4  # Output latent size
+        resblock_updown: True
+        use_scale_shift_norm: True
+        use_spatial_transformer: False
+      
+      # Diffusion process parameters
+      eta: 1.0
+      loss_type: l1
+      max_var: 1.0
+      mt_type: linear
+      num_timesteps: 1000
+      objective: grad
+      sample_step: 200
+      sample_type: linear
+      skip_sample: True
+  
+  # Conditional Stage (for attention maps)
+  CondStageParams:
+    in_channels: 1
+    n_stages: 2
+    out_channels: 1  # Output single channel attention map
+  
+  # EMA (Exponential Moving Average)
+  EMA:
+    ema_decay: 0.995
+    start_ema_step: 30000
+    update_ema_interval: 8
+    use_ema: True
+  
+  # UNet Segmentation Model (for Attention Map generation)
+  AttentionMapSegmentation:
+    # U-Net based segmentation for attention map extraction
+    model_type: UNet
+    in_channels: 1
+    out_channels: 1
+    features: [64, 128, 256, 512]
+    dropout_rate: 0.1
+  
+  # Global model configuration
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  
+  model_name: CPDM
+  model_type: CPDM
+
+runner: CPDMRunner
+
+# Training configuration
+training:
+  # Training strategy
+  accumulate_grad_batches: 4
+  n_epochs: 200
+  n_steps: 500000
+  
+  # Checkpointing
+  sample_interval: 2
+  save_interval: 2
+  validation_interval: 2
+  
+  # Logging
+  log_interval: 100
+  
+  # Mixed precision
+  use_amp: False
+  
+  # Gradient clipping
+  grad_clip: 1.0
+
+# Testing/Validation configuration
+testing:
+  clip_denoised: False
+  sample_num: 1
+  metrics:
+    - lpips
+    - mae
+    - ssim
+    - psnr
+
+# Paths and logging
+paths:
+  results_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/results/CPDM'
+  checkpoint_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/CPDM'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/CPDM'
+  
+# Weights & Biases logging
+wandb:
+  project: 'CT2PET-CPDM'
+  entity: null
+  name: 'CPDM-AutoPET-64x64'
+  notes: 'Complete CPDM training with VQGAN, BB Diffusion, and Attention Map Segmentation'
+  log_frequency: 100
