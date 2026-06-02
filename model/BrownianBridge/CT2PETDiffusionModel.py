@@ -138,16 +138,16 @@ class CT2PETDiffusionModel(BrownianBridgeModel):
 
         return attenuation_factors
 
-    def get_attenuation_map(self, x_cond, x_cond_latent):  
+    def get_attenuation_map(self, x_cond, x_cond_latent):
         conditions = []
-        
-        for i in range(x_cond.shape[0]):
-            rescale_slope = 1.
-            rescale_intercept = -1024.
 
+        # preprocess_autopet.normalize_ct maps HU in [HU_MIN, HU_MAX] to [-1, 1] via
+        # ct_norm = (HU - HU_MIN) / (HU_MAX - HU_MIN) * 2 - 1. Invert to recover HU.
+        HU_MIN, HU_MAX = -1000.0, 3071.0
+
+        for i in range(x_cond.shape[0]):
             np_x_cond = x_cond[i].squeeze(0).cpu().numpy()
-            np_x_cond = np_x_cond * 2047.
-            HU_map = np_x_cond * rescale_slope + rescale_intercept
+            HU_map = (np_x_cond + 1.0) * 0.5 * (HU_MAX - HU_MIN) + HU_MIN
 
             KVP = 140 
             attenuation_factors = self.attenuationCT_to_511(KVP, HU_map)

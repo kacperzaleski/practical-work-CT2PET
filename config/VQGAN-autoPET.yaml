@@ -3,19 +3,16 @@
 
 data:
   dataset_name: 'CT2PET_autoPET'
-  dataset_type: 'custom_aligned'
+  dataset_type: 'ct2pet_aligned'
   dataset_config:
     # Data paths
     data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed'
-    ct_max: 3071
-    pet_max: 32
-    
+
     # Image configuration
     image_size: 64
     channels: 1
-    target_image_size: 64
-    
-    # Normalization
+
+    # Already normalized to [-1, 1] in preprocessing.
     to_normal: True
     flip: True
     

@@ -1,5 +1,6 @@
 import os
 
+import torch
 import torch.optim.lr_scheduler
 from torch.utils.data import DataLoader
 
@@ -10,12 +11,76 @@ from model.BrownianBridge.LatentBrownianBridgeModel import LatentBrownianBridgeM
 from model.BrownianBridge.CT2PETDiffusionModel import CT2PETDiffusionModel
 from runners.DiffusionBasedModelRunners.DiffusionBaseRunner import DiffusionBaseRunner
 from runners.utils import weights_init, get_optimizer, get_dataset, make_dir, get_image_grid, save_single_image
+from utils import namespace2dict
 from tqdm.autonotebook import tqdm
+
+
+class WandbTBWriter:
+    """
+    Adapter exposing the subset of torch.utils.tensorboard.SummaryWriter that CPDMRunner /
+    BaseRunner / DiffusionBaseRunner actually call (add_scalar, add_image), mirroring each
+    log to both TensorBoard and Weights & Biases. Any other attribute access falls through
+    to the wrapped TB writer so the rest of the runner code keeps working unmodified.
+    """
+    def __init__(self, tb_writer, wandb_run):
+        self._tb = tb_writer
+        self._wb = wandb_run  # already-initialized wandb run
+
+    def add_scalar(self, tag, value, step):
+        self._tb.add_scalar(tag, value, step)
+        try:
+            v = value.detach().item() if isinstance(value, torch.Tensor) else float(value)
+        except Exception:
+            return
+        self._wb.log({tag: v}, step=int(step))
+
+    def add_image(self, tag, image, step, dataformats='HWC'):
+        self._tb.add_image(tag, image, step, dataformats=dataformats)
+        import wandb as _wandb
+        # image arrives as a uint8 numpy array (HWC by default in this codebase).
+        self._wb.log({tag: _wandb.Image(image)}, step=int(step))
+
+    def __getattr__(self, name):
+        return getattr(self._tb, name)
 
 @Registers.runners.register_with_name('CPDMRunner')
 class CPDMRunner(DiffusionBaseRunner):
     def __init__(self, config):
         super().__init__(config)
+        self._maybe_attach_wandb(config)
+
+    def _maybe_attach_wandb(self, config):
+        """
+        If config has a `wandb` section with a project, init a wandb run and wrap
+        self.writer so add_scalar / add_image push to both TensorBoard and W&B.
+        Safe to omit (or set wandb.project: null) to keep TensorBoard-only logging.
+
+        Only rank 0 logs under DDP. Errors initializing wandb are swallowed so
+        training is never blocked by network or auth issues.
+        """
+        if not hasattr(config, 'wandb'):
+            return
+        wb_cfg = config.wandb
+        project = getattr(wb_cfg, 'project', None)
+        if not project:
+            return
+        if getattr(config.training, 'use_DDP', False) and getattr(config.training, 'local_rank', 0) != 0:
+            return
+        try:
+            import wandb
+            run = wandb.init(
+                project=project,
+                entity=getattr(wb_cfg, 'entity', None) or None,
+                name=getattr(wb_cfg, 'name', None),
+                notes=getattr(wb_cfg, 'notes', None),
+                config=namespace2dict(config),
+                dir=self.config.result.log_path,
+                resume='allow',
+            )
+            self.writer = WandbTBWriter(self.writer, run)
+            print(f'[wandb] logging to project={project} run={run.name}')
+        except Exception as e:
+            print(f'[wandb] init failed ({e!r}); falling back to TensorBoard-only logging')
 
     def initialize_model(self, config):
         if config.model.model_type == "BBDM":
@@ -59,12 +124,11 @@ class CPDMRunner(DiffusionBaseRunner):
 
     def initialize_optimizer_scheduler(self, net, config):
         optimizer = get_optimizer(config.model.BB.optimizer, net.get_parameters())
+        # `verbose=` was removed from ReduceLROnPlateau in PyTorch 2.x.
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                                mode='min',
-                                                               verbose=True,
                                                                threshold_mode='rel',
-                                                               **vars(config.model.BB.lr_scheduler)
-)
+                                                               **vars(config.model.BB.lr_scheduler))
         return [optimizer], [scheduler]
 
     @torch.no_grad()

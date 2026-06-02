@@ -3,35 +3,45 @@
 
 data:
   dataset_name: 'CT2PET_autoPET'
-  dataset_type: 'custom_aligned'
+  dataset_type: 'ct2pet_aligned'
   dataset_config:
     # Data paths
     data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed'
-    ct_max: 3071  # HU units max value for normalization
-    pet_max: 32   # SUV max value for normalization
-    
+
     # Image configuration
     image_size: 64
     channels: 1   # Single channel for each modality
-    target_image_size: 64
+
+    # Already normalized to [-1, 1] in preprocessing; runner uses to_normal for image-grid rendering.
+    to_normal: True
+    flip: True
+
+    # max_pixel_cond / max_pixel_ori are referenced by CPDMRunner.sample_to_eval to invert
+    # the runner-side save normalization. Our data is already in [-1, 1] so a passthrough
+    # of 1.0 leaves saved arrays untouched.
+    max_pixel_cond: 1.0
+    max_pixel_ori: 1.0
+
+    # Per-split cap on dataset size. Keeps a CPU "epoch" bounded so the runner's
+    # full-DataLoader iteration in BaseRunner.train() finishes in reasonable time.
+    max_samples:
+      train: 2000
+      val: 200
+      test: 200
     
-    # Normalization
-    to_normal: True  # Already normalized to [-1, 1] in preprocessing
-    flip: True       # Random horizontal flips during training
-    
+  # Note: BaseRunner.train hardcodes num_workers=24; the worker count here is informational.
   train:
-    batch_size: 16
+    batch_size: 8
     shuffle: True
     num_workers: 4
-    prefetch_factor: 2
-    
+
   val:
-    batch_size: 32
+    batch_size: 8
     shuffle: False
     num_workers: 2
-    
+
   test:
-    batch_size: 32
+    batch_size: 8
     shuffle: False
     num_workers: 2
 
@@ -59,8 +69,11 @@ model:
       
       lossconfig:
         target: torch.nn.Identity
-      
-      ckpt_path: null  # Will be set during training
+
+      # VQGAN checkpoint trained by train_vqgan.py (Lightning ckpt with `state_dict` key).
+      # CT2PETDiffusionModel.__init__ instantiates VQModel(**vars(params)); VQModel.init_from_ckpt
+      # reads sd['state_dict'] and loads with strict=False so extra Lightning keys are ignored.
+      ckpt_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/VQGAN/vqgan-epoch=01-v2.ckpt'
 
   # Brownian Bridge Diffusion Model (Main model)
   BB:
@@ -82,19 +95,25 @@ model:
     # Model parameters
     params:
       UNetParams:
-        attention_resolutions: !!python/tuple [32, 16, 8]
+        # Denoiser operates on the VQGAN latent: 4 × 16 × 16 (not the 64×64 pixel input).
+        # Paper uses 256×256 input → 4× downsampling VQGAN → 64 latent and attention at {32,16,8};
+        # our 64×64 input → 4× downsampling VQGAN → 16 latent, so we scale attention proportionally.
+        attention_resolutions: !!python/tuple [8, 4]
         channel_mult: !!python/tuple [1, 2, 3, 4]
         condition_key: SpatialRescaler
         context_dim: null
         conv_resample: True
         dims: 2
-        image_size: 64
-        in_channels: 11  # 4 (latent CT) + 4 (latent PET) + 1 (attention map) + 1 (attenuation map) + 1 (concatenation)
+        image_size: 16
+        # Channel composition at UNet input: x_t (z_channels=4) + cat([SR(att_map), SR(atte_map)])
+        # where each SpatialRescaler outputs CondStageParams.out_channels = z_channels = 4.
+        # Total = 4 + 4 + 4 = 12. Matches original Template-CPDM's 3·z_channels rule (3+3+3 = 9).
+        in_channels: 12
         model_channels: 128
         num_head_channels: 64
         num_heads: 8
         num_res_blocks: 2
-        out_channels: 4  # Output latent size
+        out_channels: 4  # = z_channels, the BB target latent
         resblock_updown: True
         use_scale_shift_norm: True
         use_spatial_transformer: False
@@ -110,11 +129,14 @@ model:
       sample_type: linear
       skip_sample: True
   
-  # Conditional Stage (for attention maps)
+  # Conditional Stage (one SpatialRescaler per conditioning map: attention + attenuation).
+  # n_stages=2 with the default multiplier=0.5 halves spatial size twice (64 -> 16 = latent res).
+  # out_channels = VQGAN z_channels, so each rescaler produces a context block whose channel
+  # count matches the BB latent. UNet in_channels is then 3 * z_channels (see notes above).
   CondStageParams:
     in_channels: 1
     n_stages: 2
-    out_channels: 1  # Output single channel attention map
+    out_channels: 4
   
   # EMA (Exponential Moving Average)
   EMA:
@@ -136,31 +158,32 @@ model:
   latent_before_quant_conv: False
   normalize_latent: False
   only_load_latent_mean_std: False
-  
+
+  # Pre-exported attention maps (sigmoid probs, thresholded at 0.5 inside the model).
+  # Produced by export_attention_maps.py using the trained AttentionMap UNet.
+  attention_map_train_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed/train/AttentionMaps'
+  attention_map_val_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed/val/AttentionMaps'
+
   model_name: CPDM
   model_type: CPDM
 
 runner: CPDMRunner
 
-# Training configuration
+# Training configuration (tuned for CPU demo; override via --max_epoch / --max_steps)
 training:
-  # Training strategy
-  accumulate_grad_batches: 4
-  n_epochs: 200
-  n_steps: 500000
-  
-  # Checkpointing
-  sample_interval: 2
-  save_interval: 2
-  validation_interval: 2
-  
-  # Logging
-  log_interval: 100
-  
-  # Mixed precision
+  accumulate_grad_batches: 1
+  n_epochs: 3
+  n_steps: 400
+
+  # sample_interval * epoch_length = global-step interval for in-training sampling.
+  # Sampling runs the full BB reverse process (~200 timesteps), too expensive for CPU runs.
+  sample_interval: 100
+  save_interval: 1
+  validation_interval: 1
+
+  log_interval: 50
+
   use_amp: False
-  
-  # Gradient clipping
   grad_clip: 1.0
 
 # Testing/Validation configuration

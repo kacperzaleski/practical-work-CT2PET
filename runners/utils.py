@@ -6,6 +6,7 @@ from torchvision.utils import make_grid
 import numpy as np
 from Register import Registers
 from datasets.custom import CustomAlignedDataset
+from datasets.CT2PETAlignedDataset import CT2PETAlignedDataset  # noqa: F401 (registry trigger)
 
 def remove_file(fpath):
     if os.path.exists(fpath):
