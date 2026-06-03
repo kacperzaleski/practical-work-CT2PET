@@ -169,11 +169,14 @@ model:
 
 runner: CPDMRunner
 
-# Training configuration (tuned for CPU demo; override via --max_epoch / --max_steps)
+# Training configuration. n_epochs / n_steps are set high; in practice the run
+# terminates via the early_stopping block below (CPDMRunner.validation_epoch
+# tightens config.training.n_steps to break the outer loop when val loss
+# stagnates).
 training:
   accumulate_grad_batches: 1
-  n_epochs: 3
-  n_steps: 400
+  n_epochs: 100
+  n_steps: 200000
 
   # sample_interval * epoch_length = global-step interval for in-training sampling.
   # Sampling runs the full BB reverse process (~200 timesteps), too expensive for CPU runs.
@@ -186,10 +189,21 @@ training:
   use_amp: False
   grad_clip: 1.0
 
-# Testing/Validation configuration
+  # Early stopping monitors val_epoch/loss after each validation_epoch. Patience
+  # is chosen to be larger than the ReduceLROnPlateau effective patience
+  # (~3000 iter / iters_per_epoch ≈ 12 epochs at 250 iter/epoch), so we always
+  # observe at least one LR drop before bailing.
+  early_stopping:
+    patience: 15
+    min_delta: 0.0005
+
 testing:
   clip_denoised: False
   sample_num: 1
+  # Number of val batches the per-epoch paper-metric evaluation runs the
+  # full BB reverse process on (LPIPS/MAE/SSIM/PSNR). 2 batches × bs=8 = 16
+  # samples; each batch takes ~200 UNet forward passes.
+  metrics_eval_max_batches: 2
   metrics:
     - lpips
     - mae

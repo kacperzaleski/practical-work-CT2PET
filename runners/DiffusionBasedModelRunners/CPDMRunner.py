@@ -1,5 +1,7 @@
+import math
 import os
 
+import numpy as np
 import torch
 import torch.optim.lr_scheduler
 from torch.utils.data import DataLoader
@@ -11,7 +13,6 @@ from model.BrownianBridge.LatentBrownianBridgeModel import LatentBrownianBridgeM
 from model.BrownianBridge.CT2PETDiffusionModel import CT2PETDiffusionModel
 from runners.DiffusionBasedModelRunners.DiffusionBaseRunner import DiffusionBaseRunner
 from runners.utils import weights_init, get_optimizer, get_dataset, make_dir, get_image_grid, save_single_image
-from utils import namespace2dict
 from tqdm.autonotebook import tqdm
 
 
@@ -48,6 +49,15 @@ class CPDMRunner(DiffusionBaseRunner):
     def __init__(self, config):
         super().__init__(config)
         self._maybe_attach_wandb(config)
+        self._init_eval_metrics(config)
+        # Early-stopping state tracked across validation_epoch calls.
+        self._best_val_loss = float('inf')
+        self._patience_counter = 0
+        self._stop_signaled = False
+        es = getattr(config.training, 'early_stopping', None)
+        self._es_patience = int(getattr(es, 'patience', 0)) if es is not None else 0
+        self._es_min_delta = float(getattr(es, 'min_delta', 0.0)) if es is not None else 0.0
+        self._es_enabled = self._es_patience > 0
 
     def _maybe_attach_wandb(self, config):
         """
@@ -68,6 +78,7 @@ class CPDMRunner(DiffusionBaseRunner):
             return
         try:
             import wandb
+            from utils import namespace2dict  # lazy: utils.py imports CPDMRunner at top
             run = wandb.init(
                 project=project,
                 entity=getattr(wb_cfg, 'entity', None) or None,
@@ -81,6 +92,133 @@ class CPDMRunner(DiffusionBaseRunner):
             print(f'[wandb] logging to project={project} run={run.name}')
         except Exception as e:
             print(f'[wandb] init failed ({e!r}); falling back to TensorBoard-only logging')
+
+    # --- paper-aligned eval metrics: LPIPS, MAE, SSIM, PSNR ---------------------------------
+
+    def _init_eval_metrics(self, config):
+        """Set how often paper metrics are recomputed (per epoch). LPIPS is lazy-loaded."""
+        self._lpips_model = None
+        self._metrics_eval_max_batches = int(
+            getattr(getattr(config, 'testing', object()), 'metrics_eval_max_batches', 4)
+        )
+
+    def _get_lpips(self, device):
+        if self._lpips_model is None:
+            import lpips as _lpips
+            # VGG net used by the paper.
+            m = _lpips.LPIPS(net='vgg').to(device).eval()
+            for p in m.parameters():
+                p.requires_grad = False
+            self._lpips_model = m
+        return self._lpips_model
+
+    @staticmethod
+    def _to3ch(x):
+        # x in [-1, 1], (B, 1, H, W) -> (B, 3, H, W) tiled.
+        return x.expand(-1, 3, -1, -1)
+
+    @torch.no_grad()
+    def _compute_paper_metrics(self, pred, target):
+        """
+        Pixel-space LPIPS/MAE/SSIM/PSNR matching the paper's evaluation.
+        Inputs are float tensors in [-1, 1], shape (B, 1, H, W).
+        """
+        from skimage.metrics import structural_similarity as _ssim
+        from skimage.metrics import peak_signal_noise_ratio as _psnr
+
+        pred = pred.detach().clamp_(-1.0, 1.0)
+        target = target.detach().clamp_(-1.0, 1.0)
+        device = pred.device
+
+        # Map to [0, 1] for SSIM/PSNR (interpretable as image intensity).
+        pred01 = pred.mul(0.5).add(0.5)
+        tgt01 = target.mul(0.5).add(0.5)
+
+        mae = (pred - target).abs().mean().item()
+
+        # LPIPS expects 3ch images in [-1, 1].
+        lpips_model = self._get_lpips(device)
+        lpips_val = lpips_model(self._to3ch(pred), self._to3ch(target)).mean().item()
+
+        # SSIM / PSNR per-image then averaged.
+        pred_np = pred01.squeeze(1).cpu().numpy()
+        tgt_np = tgt01.squeeze(1).cpu().numpy()
+        ssim_vals, psnr_vals = [], []
+        for p, t in zip(pred_np, tgt_np):
+            ssim_vals.append(_ssim(p, t, data_range=1.0))
+            try:
+                psnr_vals.append(_psnr(t, p, data_range=1.0))
+            except Exception:
+                psnr_vals.append(float('nan'))
+        ssim = float(np.nanmean(ssim_vals)) if ssim_vals else float('nan')
+        psnr = float(np.nanmean(psnr_vals)) if psnr_vals else float('nan')
+        return {'lpips': lpips_val, 'mae': mae, 'ssim': ssim, 'psnr': psnr}
+
+    @torch.no_grad()
+    def _evaluate_paper_metrics(self, val_loader, epoch):
+        """
+        Runs the full BB reverse process on up to _metrics_eval_max_batches val batches
+        and reports LPIPS/MAE/SSIM/PSNR averaged across them. Logs scalars to TB+W&B.
+        """
+        net = self.net.module if self.config.training.use_DDP else self.net
+        net.eval()
+        device = self.config.training.device[0]
+        agg = {'lpips': [], 'mae': [], 'ssim': [], 'psnr': []}
+        n = 0
+        for batch in val_loader:
+            if n >= self._metrics_eval_max_batches:
+                break
+            (x, x_name), (x_cond, x_cond_name) = batch
+            x = x.to(device)
+            x_cond = x_cond.to(device)
+            try:
+                sample, _ = net.sample(x_cond, x_name, 'val', clip_denoised=False)
+            except Exception as e:
+                print(f'[metrics] sampling failed at epoch {epoch}: {e!r}')
+                return None
+            m = self._compute_paper_metrics(sample, x)
+            for k, v in m.items():
+                if not (isinstance(v, float) and math.isnan(v)):
+                    agg[k].append(v)
+            n += 1
+        if n == 0 or not agg['mae']:
+            return None
+        means = {k: float(np.mean(v)) if v else float('nan') for k, v in agg.items()}
+        for k, v in means.items():
+            self.writer.add_scalar(f'metrics/{k}', v, epoch)
+        print(f'[metrics] epoch={epoch} ' + ' '.join(f'{k}={v:.4f}' for k, v in means.items()))
+        return means
+
+    # --- early-stopping integration -------------------------------------------------------
+
+    @torch.no_grad()
+    def validation_epoch(self, val_loader, epoch):
+        average_loss = super().validation_epoch(val_loader, epoch)
+        try:
+            avg_l = float(average_loss.detach()) if torch.is_tensor(average_loss) else float(average_loss)
+        except Exception:
+            avg_l = None
+
+        # Paper metrics on a small fixed val subset, every epoch.
+        self._evaluate_paper_metrics(val_loader, epoch)
+
+        if self._es_enabled and avg_l is not None and math.isfinite(avg_l):
+            if avg_l < self._best_val_loss - self._es_min_delta:
+                self._best_val_loss = avg_l
+                self._patience_counter = 0
+            else:
+                self._patience_counter += 1
+                print(f'[early-stop] epoch={epoch} no improvement '
+                      f'({avg_l:.5f} vs best {self._best_val_loss:.5f}); '
+                      f'patience {self._patience_counter}/{self._es_patience}')
+            if self._patience_counter >= self._es_patience:
+                # Force-break the outer epoch loop in BaseRunner.train by tightening n_steps.
+                self.config.training.n_steps = self.global_step - 1
+                self._stop_signaled = True
+                print(f'[early-stop] triggered at epoch {epoch} '
+                      f'(best val loss {self._best_val_loss:.5f}); '
+                      f'capping n_steps={self.config.training.n_steps}')
+        return average_loss
 
     def initialize_model(self, config):
         if config.model.model_type == "BBDM":

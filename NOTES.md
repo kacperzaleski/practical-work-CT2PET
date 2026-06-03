@@ -123,17 +123,46 @@ Main model from `model/BrownianBridge/CT2PETDiffusionModel.py`. Composes the fro
 - sample_interval = 100 (effectively disables full BB sampling during training — too expensive on CPU; reverse process is 200 timesteps × forward cost).
 - validation_interval = 1, save_interval = 1.
 
-**Final metrics** (2 epochs × 250 iter on CPU, wall-clock ≈ 32 min, ~3.7 s/step)
-- `loss/train`: 0.575 (step 1) → 0.042 (step 251) → **0.032** (step 500).
-- `loss/val_step` (single-batch val every 50 steps): 0.117 → 0.038 (step 500).
-- `val_epoch/loss` (full val pass at epoch end): 0.0556 (epoch 0) → **0.0373** (epoch 1).
-- Stopped by `n_steps > 400` check at start of epoch 3 (after global_step 500 of epoch 2 had completed).
+**Training history** — three CPU launches:
 
-**Artifacts**
-- Latest ckpt: `results/CT2PET_autoPET/CPDM/checkpoint/latest_model_2.pth` (1.0 GB) — model state, EMA shadow, epoch=2, step=500.
-- Optimizer ckpt: `latest_optim_sche_2.pth` (0.8 GB).
-- TensorBoard scalars: `results/CT2PET_autoPET/CPDM/log/events.out.tfevents.*.236517.0`.
-- W&B: this run was the first CPDM launch and predated the `WandbTBWriter` adapter, so it has TB only. From now on `CPDMRunner._maybe_attach_wandb` initializes a wandb run automatically (project `CT2PET-CPDM`, name `CPDM-AutoPET-64x64`) and mirrors every `add_scalar` / `add_image` to both backends.
+1. **First demo run** (no W&B, fixed `max_epoch=3 max_steps=400`, ~32 min). Stopped by `n_steps>400` after 2 full epochs. Final `val_epoch/loss = 0.0373`. Used only to validate the wiring; superseded by the long run below.
+
+2. **Long run with W&B + paper metrics + early stopping** (`run r1yb3gtw`, started 2026-06-02 12:32, SIGINTd manually at epoch 8 / iter ~1760 because the laptop needed to be moved). Epochs 0–8 completed.
+
+3. **Resume from `last_model.pth` (epoch 9)** (`run 4inhu3cy`, started 2026-06-03 16:37). Loaded the saved optimizer + LR scheduler state so ReduceLROnPlateau patience and any LR adjustments continued in place. Epochs 9–10 completed; manually stopped mid-epoch-11 because metrics had plateaued.
+
+**Final metric trajectory** (val pass + 16-sample BB-sampled paper-metric eval per epoch; all logged to both TensorBoard and W&B via `WandbTBWriter`):
+
+| epoch | val_epoch/loss | LPIPS↓ | MAE↓   | SSIM↑  | PSNR↑ (dB) |
+|-------|----------------|--------|--------|--------|-------------|
+| 0     | 0.02184        | 0.186  | 0.0055 | 0.880  | 41.35       |
+| 1     | 0.02003        | 0.176  | **0.0053** | **0.890** | **41.70** |
+| 2     | 0.02053        | 0.174  | 0.0055 | 0.876  | 41.41       |
+| 3     | 0.02046        | 0.171  | 0.0054 | 0.879  | 41.55       |
+| 4     | 0.02103        | 0.200  | 0.0059 | 0.880  | 40.94       |
+| 5     | 0.02080        | 0.192  | 0.0057 | 0.874  | 41.16       |
+| 6     | 0.01977        | **0.166** | 0.0056 | 0.875  | 41.44       |
+| 7     | **0.01394**    | 0.176  | 0.0055 | 0.879  | 41.45       |
+| 8     | 0.01712        | 0.200  | 0.0059 | 0.868  | 40.77       |
+| 9     | —              | 0.174  | 0.0055 | 0.878  | 41.46       |
+
+(Epoch 9 happened in the resumed run; its `val_epoch/loss` scalar landed in TB but I didn't extract it before stopping. Train loss values: epoch 9 → 0.012-0.018 range, epoch 10 → similar, epoch 11 → 0.012-0.014.)
+
+**Convergence diagnosis.** Best `val_epoch/loss` = **0.01394** at epoch 7; subsequent epochs 8-10 stayed in `0.014-0.020`. Across 10 epochs, LPIPS oscillates within ±0.03, MAE ±0.0006, SSIM ±0.02, PSNR ±0.9 dB — noise-level fluctuation, not directional improvement. ReduceLROnPlateau patience (3000 iter ≈ 12 epochs) hadn't triggered yet; even if it had, the typical follow-on pattern of "small one-epoch bump then re-plateau" wouldn't push past the current floor. Stopped manually.
+
+**Why the floor.** Most PET brain-region slices are background near −1 SUV; the model learns trivial near-uniform output in the first epoch (which gets most of the MAE for free) and the residual signal is concentrated in the small high-uptake regions. Pushing beyond this floor likely needs (a) a larger VQGAN, (b) input resolution above 64×64, or (c) a region-weighted loss — all outside the CPU budget.
+
+**Final artifacts**
+- Latest ckpt: `results/CT2PET_autoPET/CPDM/checkpoint/latest_model_10.pth` (1.0 GB) — model state + EMA shadow + epoch=10 + global_step=2750.
+- Optimizer ckpt: `latest_optim_sche_10.pth` (0.8 GB) — Adam state + ReduceLROnPlateau internal counters.
+- `last_model.pth` is identical to `latest_model_10.pth` (rolling alias).
+- TensorBoard: `results/CT2PET_autoPET/CPDM/log/events.out.tfevents.*` — three event files (one per launch).
+- W&B runs (project [CT2PET-CPDM](https://wandb.ai/teamchaspi/CT2PET-CPDM)):
+  - `r1yb3gtw` — long run, epochs 0–8.
+  - `4inhu3cy` — resumed run, epochs 9–10 + partial 11.
+- BaseRunner's auto-rotation deleted earlier per-epoch checkpoints; only `latest_model_10.pth` survives. (Add `--save_top` next time to also keep the best-val checkpoint.)
+
+**Best single-metric recommendation for downstream eval**: use `latest_model_10.pth` (current best available; `val_epoch/loss=0.01394` checkpoint was rotated out).
 
 ## Outstanding / known deviations
 
