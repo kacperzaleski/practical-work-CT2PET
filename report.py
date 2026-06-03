@@ -38,17 +38,14 @@ images at the trained sample_step=200).
 # %%
 import os
 import sys
-import json
 import math
 import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 
 # Repo imports
 PROJ = Path('/home/kacperzaleski/Projects/practical-work-CT2PET').resolve()
