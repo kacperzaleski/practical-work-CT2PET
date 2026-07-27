@@ -1,0 +1,62 @@
+# Posterior-Mean Rectified Flow (PMRF) for CT->PET on the full-body autoPET set.
+#
+# Consumed by the standalone Lightning trainers (train_pmrf_stage1.py,
+# train_flow.py) and sample_pmrf.py via pmrf_common.py. Unlike CPDM this runs
+# in pixel space (no VQGAN, no attention / attenuation maps).
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'ct2pet_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+    image_size: 64
+    channels: 1
+    to_normal: True          # data already in [-1, 1]
+    flip: True
+    # Per-split cap to bound CPU epochs at 128x128 (single-CPU budget, ~1-2
+    # nights per model to early-stop). At base_ch=32 a train step (~batch 8) is
+    # ~3s, so 5000 samples ~= 625 steps ~= 30 min/epoch. Raise for better HW.
+    max_samples:
+      train: 5000
+      val: 800
+      test: 1000
+
+model:
+  model_name: PMRF
+  # 2D residual U-Net shared by all three models (time-conditioned for the flow).
+  # ch_mult length sets the downsampling depth: at 128px, (1,2,4,8) bottlenecks
+  # at 16x16. base_ch traded down to 48 to keep CPU training tractable.
+  unet:
+    base_ch: 32
+    ch_mult: !!python/tuple [1, 2, 4, 8]
+    num_res_blocks: 2
+  flow:
+    sigma_s: 0.1             # diversity noise added to the starting sample z0
+    num_steps_train: 100    # K used implicitly via flow-matching (no integration)
+    num_steps_eval: 200     # K Euler steps at inference (paper's best operating point)
+
+training:
+  optimizer: AdamW
+  lr: 5.0e-4
+  lr_schedule: cosine
+  max_epochs: 200
+  early_stopping_patience: 20
+  batch_size_stage1: 128
+  batch_size_flow: 64
+  grad_clip: 1.0
+
+testing:
+  metrics: ['MSE', 'PSNR', 'SSIM', 'LPIPS', 'FID', 'KID']
+
+paths:
+  checkpoint_dir_stage1: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/PMRF_stage1'
+  checkpoint_dir_rf: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/PMRF_rf'
+  checkpoint_dir_pmrf: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/PMRF_pmrf'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/PMRF'
+
+wandb:
+  project: 'CT2PET-PMRF'
+  entity: null
+  name: 'PMRF-AutoPET-fullbody-64x64'
+  notes: 'Flow-based CT->PET (PM / RF / PMRF) on full-body autoPET'
+  log_frequency: 100

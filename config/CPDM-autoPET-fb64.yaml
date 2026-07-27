@@ -1,0 +1,190 @@
+# CPDM — 64x64 head+torso, background-cropped variant (thesis comparison set).
+# Identical architecture to the legacy brain-64 config/CPDM-autoPET.yaml (VQGAN
+# ch_mult (1,2,4) -> 4x16x16 latent, CondStageParams n_stages=2, BB-UNet image_size
+# 16). Differs only by: data_root -> processed_fullbody, dataset_name ->
+# CT2PET_autoPET_fullbody (so results land in a separate dir, preserving the brain
+# run), attention-map paths -> processed_fullbody, the VQGAN_fb64 ckpt, and
+# max_samples raised to 5000/800/1000 to match PMRF-autoPET.yaml for comparability.
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'ct2pet_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+
+    image_size: 64
+    channels: 1
+
+    to_normal: True
+    flip: True
+
+    max_pixel_cond: 1.0
+    max_pixel_ori: 1.0
+
+    # Matched to PMRF-autoPET.yaml so the metric tables are directly comparable.
+    max_samples:
+      train: 5000
+      val: 800
+      test: 256
+
+  train:
+    batch_size: 8
+    shuffle: True
+    num_workers: 4
+
+  val:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+  test:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+model:
+  VQGAN:
+    ckpt_path: null
+    params:
+      ddconfig:
+        attn_resolutions: []
+        ch: 128
+        ch_mult: !!python/tuple [1, 2, 4]
+        double_z: False
+        dropout: 0.0
+        in_channels: 1
+        out_ch: 1
+        num_res_blocks: 2
+        resolution: 64
+        z_channels: 4
+
+      embed_dim: 4
+      n_embed: 8192
+
+      lossconfig:
+        target: torch.nn.Identity
+
+      # Set after VQGAN-autoPET-fb64.yaml finishes training.
+      ckpt_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/VQGAN_fb64/last.ckpt'
+
+  BB:
+    lr_scheduler:
+      cooldown: 3000
+      factor: 0.5
+      min_lr: 5.0e-07
+      patience: 3000
+      threshold: 0.0001
+
+    optimizer:
+      beta1: 0.9
+      lr: 0.0001
+      optimizer: Adam
+      weight_decay: 0.0
+
+    params:
+      UNetParams:
+        attention_resolutions: !!python/tuple [8, 4]
+        channel_mult: !!python/tuple [1, 2, 3, 4]
+        condition_key: SpatialRescaler
+        context_dim: null
+        conv_resample: True
+        dims: 2
+        image_size: 16
+        in_channels: 12
+        model_channels: 128
+        num_head_channels: 64
+        num_heads: 8
+        num_res_blocks: 2
+        out_channels: 4
+        resblock_updown: True
+        use_scale_shift_norm: True
+        use_spatial_transformer: False
+
+      eta: 1.0
+      loss_type: l1
+      max_var: 1.0
+      mt_type: linear
+      num_timesteps: 1000
+      objective: grad
+      sample_step: 200
+      sample_type: linear
+      skip_sample: True
+
+  CondStageParams:
+    in_channels: 1
+    n_stages: 2
+    out_channels: 4
+
+  EMA:
+    ema_decay: 0.995
+    # Lowered 30000 -> 5000 for the epoch-27 continuation run: the blob run only
+    # reached step 16875, so at 30000 the EMA shadow never averaged (it just copied
+    # the live weights every update_ema_interval). With the resume global_step (16875)
+    # now > start_ema_step, decayed averaging engages immediately, giving smoother
+    # eval weights (see NOTES_BA.md §12).
+    start_ema_step: 5000
+    update_ema_interval: 8
+    use_ema: True
+
+  AttentionMapSegmentation:
+    model_type: UNet
+    in_channels: 1
+    out_channels: 1
+    features: [64, 128, 256, 512]
+    dropout_rate: 0.1
+
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+
+  # Exported by export_attention_maps.py from the AttentionMap_fb64 UNet.
+  attention_map_train_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/train/AttentionMaps'
+  # NOTE: get_attention_map has no test path and --sample_to_eval passes stage='val_step',
+  # so it reads THIS path for the test loader. To re-run CPDM test sampling, temporarily
+  # point this at .../test/AttentionMaps (see NOTES_BA.md §9.4), then revert to val.
+  attention_map_val_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/val/AttentionMaps'
+
+  model_name: CPDM
+  model_type: CPDM
+
+runner: CPDMRunner
+
+training:
+  accumulate_grad_batches: 1
+  n_epochs: 100
+  n_steps: 200000
+
+  sample_interval: 100
+  save_interval: 1
+  validation_interval: 1
+
+  log_interval: 50
+
+  use_amp: False
+  grad_clip: 1.0
+
+  early_stopping:
+    patience: 15
+    min_delta: 0.0005
+
+testing:
+  clip_denoised: False
+  sample_num: 1
+  metrics_eval_max_batches: 2
+  metrics:
+    - lpips
+    - mae
+    - ssim
+    - psnr
+
+paths:
+  results_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/results/CPDM_fb64'
+  checkpoint_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/CPDM_fb64'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/CPDM_fb64'
+
+wandb:
+  project: 'CT2PET-CPDM'
+  entity: null
+  name: 'CPDM-AutoPET-64-headtorso-cropped'
+  notes: 'CPDM at 64 (head+torso, background-cropped, perceptual VQGAN) — thesis comparison run'
+  log_frequency: 100

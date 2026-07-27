@@ -40,15 +40,28 @@ class CT2PETAlignedDataset(Dataset):
         pet_set = {f.name for f in pet_dir.glob('*.npy')}
         self.names = [n for n in ct_names if n in pet_set]
 
-        # Optional cap on dataset size — useful for CPU training to keep an "epoch" bounded.
-        # Configured via dataset_config.max_samples (per-stage dict or single int).
-        max_samples = getattr(dataset_config, 'max_samples', None)
-        if isinstance(max_samples, dict):
-            max_samples = max_samples.get(stage)
-        elif hasattr(max_samples, stage):
-            max_samples = getattr(max_samples, stage)
-        if max_samples is not None and len(self.names) > int(max_samples):
-            self.names = self.names[:int(max_samples)]
+        # Shared multi-patient TEST manifest (test stage only). When set, restrict the
+        # test loader to exactly the slice stems listed in test_names_file — a fixed,
+        # patient-diverse set shared by every model so the comparison is apples-to-apples
+        # (see sampling_eval/build_test_manifest.py). Supersedes the max_samples cap below.
+        # Guarded to stage=='test' so it can never shrink train/val to an empty set.
+        test_names_file = getattr(dataset_config, 'test_names_file', None)
+        if stage == 'test' and test_names_file:
+            wanted = {ln.strip() for ln in open(test_names_file) if ln.strip()}
+            self.names = [n for n in self.names if Path(n).stem in wanted]
+            if not self.names:
+                raise FileNotFoundError(
+                    f'test_names_file {test_names_file} matched 0 slices under {ct_dir}')
+        else:
+            # Optional cap on dataset size — useful for CPU training to keep an "epoch"
+            # bounded. Configured via dataset_config.max_samples (per-stage dict or int).
+            max_samples = getattr(dataset_config, 'max_samples', None)
+            if isinstance(max_samples, dict):
+                max_samples = max_samples.get(stage)
+            elif hasattr(max_samples, stage):
+                max_samples = getattr(max_samples, stage)
+            if max_samples is not None and len(self.names) > int(max_samples):
+                self.names = self.names[:int(max_samples)]
 
         self.ct_dir = ct_dir
         self.pet_dir = pet_dir

@@ -1,0 +1,82 @@
+# Concatenation-conditioned latent diffusion (Diffusion 2 of the 2x2 thesis
+# comparison). A standard eps-prediction DDPM in the SAME frozen VQGAN latent that
+# CPDM uses (4x16x16), conditioned by concatenating the CT latent to the noisy PET
+# latent at every step (Palette recipe). This isolates CPDM's contribution: plain
+# conditional diffusion vs. Brownian-bridge + attention/attenuation priors, with
+# the latent space held fixed.
+#
+# Per the thesis scope decision, the denoiser is LIGHTER than CPDM's
+# (model_channels 64 vs 128, no attention) for the CPU budget; parameter counts are
+# reported so the capacity difference is transparent. Data caps match the other
+# models (5000/800/1000) for comparable metric tables.
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'ct2pet_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+    image_size: 64
+    channels: 1
+    to_normal: True
+    flip: True
+    max_pixel_cond: 1.0
+    max_pixel_ori: 1.0
+    max_samples:
+      train: 5000
+      val: 800
+      test: 1000
+
+model:
+  # Frozen VQGAN — identical to config/CPDM-autoPET-fb64.yaml (shared latent).
+  VQGAN:
+    params:
+      ddconfig:
+        attn_resolutions: []
+        ch: 128
+        ch_mult: !!python/tuple [1, 2, 4]
+        double_z: False
+        dropout: 0.0
+        in_channels: 1
+        out_ch: 1
+        num_res_blocks: 2
+        resolution: 64
+        z_channels: 4
+      embed_dim: 4
+      n_embed: 8192
+      lossconfig:
+        target: torch.nn.Identity
+      ckpt_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/VQGAN_fb64/last.ckpt'
+
+  # Denoiser — OpenAI UNetModel. in=8 (4 noisy PET latent + 4 CT-latent context;
+  # condition_key=concat makes the model concatenate context internally), out=4.
+  # Lighter than CPDM: model_channels 64, no attention (attention_resolutions []).
+  UNetParams:
+    image_size: 16
+    in_channels: 8
+    out_channels: 4
+    model_channels: 64
+    num_res_blocks: 2
+    attention_resolutions: !!python/tuple []
+    channel_mult: !!python/tuple [1, 2, 4]
+    num_heads: 1
+    num_head_channels: -1
+    condition_key: concat
+    context_dim: null
+    use_spatial_transformer: False
+    use_scale_shift_norm: True
+    resblock_updown: True
+    conv_resample: True
+    dims: 2
+
+  diffusion:
+    num_timesteps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+    sample_step: 200
+
+wandb:
+  project: 'CT2PET-ConcatDiff'
+  entity: null
+  name: 'ConcatDiff-AutoPET-64-headtorso-cropped'
+  notes: 'Concatenation-conditioned latent diffusion (Diffusion 2) — thesis comparison'
+  log_frequency: 100

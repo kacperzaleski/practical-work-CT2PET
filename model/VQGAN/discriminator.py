@@ -150,3 +150,49 @@ class NLayerDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.main(input)
+
+
+# ---------------------------------------------------------------------------
+# GAN-loss helpers for adversarial VQGAN training (training/train_vqgan_gan.py).
+# Vanilla-PyTorch equivalents of the taming-transformers VQLPIPSWithDiscriminator
+# ingredients (Esser et al. 2021), which is the loss the original CPDM VQGAN uses.
+# ---------------------------------------------------------------------------
+import torch.nn.functional as F
+
+
+def weights_init(m):
+    """pix2pix init: conv weights ~ N(0, 0.02); BatchNorm weight ~ N(1, 0.02), bias 0."""
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+
+def hinge_d_loss(logits_real, logits_fake):
+    loss_real = torch.mean(F.relu(1.0 - logits_real))
+    loss_fake = torch.mean(F.relu(1.0 + logits_fake))
+    return 0.5 * (loss_real + loss_fake)
+
+
+def vanilla_d_loss(logits_real, logits_fake):
+    return 0.5 * (torch.mean(F.softplus(-logits_real)) + torch.mean(F.softplus(logits_fake)))
+
+
+def adopt_weight(weight, global_step, threshold=0, value=0.0):
+    """Discriminator warm-up: 0 before `threshold` steps, then the full `weight`."""
+    return value if global_step < threshold else weight
+
+
+def calculate_adaptive_weight(nll_loss, g_loss, last_layer, disc_weight=1.0, eps=1e-4):
+    """d_weight = ||grad(nll)|| / ||grad(g_loss)|| at the decoder's last layer, clamped/detached.
+
+    Balances how hard the adversary pushes against how hard reconstruction pushes, so neither
+    term destabilises the other (taming's recipe). Returns a detached scalar tensor.
+    """
+    nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
+    g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
+    d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + eps)
+    d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+    return d_weight * disc_weight

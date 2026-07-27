@@ -1,0 +1,203 @@
+# CPDM — focal-attention, FROM SCRATCH, on the adversarial (GAN) VQGAN latent.
+#
+# Same architecture/data/attention-maps as config/CPDM-autoPET-fb64-focal-scratch.yaml; the ONLY
+# differences are the ones the GAN-VQGAN rerun requires:
+#   - model.VQGAN.params.ckpt_path -> checkpoints/VQGAN_gan_fb64/best.ckpt (the adversarially
+#     trained VQGAN; see training/train_vqgan_gan.py). This is a NEW latent space, so CPDM MUST be
+#     trained from random init here: the epoch-27 focal fine-tune / blob checkpoints live in the OLD
+#     latent and are invalid. Hence this is a from-scratch config (no --resume_model).
+#   - model_name: CPDM_ganvq_focal -> results land in
+#     results/CT2PET_autoPET_fullbody/CPDM_ganvq_focal/, so every current result is preserved and the
+#     thesis is only updated once this run's val+test numbers are in.
+#
+# Launch FROM SCRATCH (detached; EMA engages ~epoch 8 at step 5000):
+#   setsid nohup .venv/bin/python main.py -c config/CPDM-autoPET-fb64-ganvq-focal.yaml \
+#       -t --gpu_ids -1 --save_top < /dev/null > logs/cpdm_ganvq_focal.log 2>&1 &
+#
+# Test sampling after convergence (same get_attention_map gotcha as the other focal configs:
+# temporarily point attention_map_val_path at .../test/AttentionMaps_focal during --sample_to_eval,
+# then revert — see NOTES_BA.md §9.4):
+#   python main.py -c config/CPDM-autoPET-fb64-ganvq-focal.yaml --sample_to_eval --gpu_ids -1 \
+#       --resume_model results/CT2PET_autoPET_fullbody/CPDM_ganvq_focal/checkpoint/top_model_*.pth
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'ct2pet_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+
+    image_size: 64
+    channels: 1
+
+    to_normal: True
+    flip: True
+
+    max_pixel_cond: 1.0
+    max_pixel_ori: 1.0
+
+    max_samples:
+      train: 5000
+      val: 800
+      test: 256
+    # Shared multi-patient test manifest (test loader only; supersedes the test cap above).
+    test_names_file: '/home/kacperzaleski/Projects/practical-work-CT2PET/config/test_manifest_fb64.txt'
+
+  train:
+    batch_size: 8
+    shuffle: True
+    num_workers: 4
+
+  val:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+  test:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+model:
+  VQGAN:
+    ckpt_path: null
+    params:
+      ddconfig:
+        attn_resolutions: []
+        ch: 128
+        ch_mult: !!python/tuple [1, 2, 4]
+        double_z: False
+        dropout: 0.0
+        in_channels: 1
+        out_ch: 1
+        num_res_blocks: 2
+        resolution: 64
+        z_channels: 4
+
+      embed_dim: 4
+      n_embed: 8192
+
+      lossconfig:
+        target: torch.nn.Identity
+
+      # Adversarial (GAN) VQGAN — the faithful CPDM autoencoder. NEW latent => train CPDM from scratch.
+      # Frozen at best.ckpt = epoch 11 (val rec 0.0328), a fully adversarially-refined checkpoint (disc
+      # started at step 600 / ~epoch 1). Chosen over last.ckpt (epoch 14) via a decode check
+      # (sampling_eval/eval_vqgan_recon.py): late epochs entered discriminator dominance (d->~0.01) and
+      # last.ckpt washed out CT internal structure (CT L1 0.059 vs 0.045, LPIPS 0.218 vs 0.188) while
+      # gaining only modestly on PET. best.ckpt is the balanced autoencoder serving both CPDM's PET
+      # decode and its CT conditioning. (best.ckpt is the slim state_dict-only file, CPDM-load ready.)
+      ckpt_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/VQGAN_gan_fb64/best.ckpt'
+
+  BB:
+    lr_scheduler:
+      cooldown: 3000
+      factor: 0.5
+      min_lr: 5.0e-07
+      patience: 3000
+      threshold: 0.0001
+
+    optimizer:
+      beta1: 0.9
+      lr: 0.0001
+      optimizer: Adam
+      weight_decay: 0.0
+
+    params:
+      UNetParams:
+        attention_resolutions: !!python/tuple [8, 4]
+        channel_mult: !!python/tuple [1, 2, 3, 4]
+        condition_key: SpatialRescaler
+        context_dim: null
+        conv_resample: True
+        dims: 2
+        image_size: 16
+        in_channels: 12
+        model_channels: 128
+        num_head_channels: 64
+        num_heads: 8
+        num_res_blocks: 2
+        out_channels: 4
+        resblock_updown: True
+        use_scale_shift_norm: True
+        use_spatial_transformer: False
+
+      eta: 1.0
+      loss_type: l1
+      max_var: 1.0
+      mt_type: linear
+      num_timesteps: 1000
+      objective: grad
+      sample_step: 200
+      sample_type: linear
+      skip_sample: True
+
+  CondStageParams:
+    in_channels: 1
+    n_stages: 2
+    out_channels: 4
+
+  EMA:
+    ema_decay: 0.995
+    start_ema_step: 5000
+    update_ema_interval: 8
+    use_ema: True
+
+  AttentionMapSegmentation:
+    model_type: UNet
+    in_channels: 1
+    out_channels: 1
+    features: [64, 128, 256, 512]
+    dropout_rate: 0.1
+
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+
+  # Focal-SUV>2.0 attention maps (exported to AttentionMaps_focal; blob maps preserved).
+  attention_map_train_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/train/AttentionMaps_focal'
+  attention_map_val_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/val/AttentionMaps_focal'
+
+  model_name: CPDM_ganvq_focal
+  model_type: CPDM
+
+runner: CPDMRunner
+
+training:
+  accumulate_grad_batches: 1
+  n_epochs: 100
+  n_steps: 200000
+
+  sample_interval: 100
+  save_interval: 1
+  validation_interval: 1
+
+  log_interval: 50
+
+  use_amp: False
+  grad_clip: 1.0
+
+  early_stopping:
+    patience: 25
+    min_delta: 0.0005
+
+testing:
+  clip_denoised: False
+  sample_num: 1
+  metrics_eval_max_batches: 2
+  metrics:
+    - lpips
+    - mae
+    - ssim
+    - psnr
+
+paths:
+  results_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/results/CPDM_fb64_ganvq_focal'
+  checkpoint_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/CPDM_fb64_ganvq_focal'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/CPDM_fb64_ganvq_focal'
+
+wandb:
+  project: 'CT2PET-CPDM'
+  entity: null
+  name: 'CPDM-ganvq-focal-fromscratch'
+  notes: 'CPDM from scratch on focal-SUV>2.0 maps, in the adversarial (GAN) VQGAN latent; shared 12-patient test manifest'
+  log_frequency: 100

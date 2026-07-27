@@ -11,7 +11,7 @@ Reimplementation of the WACV 2025 paper *"CT to PET Translation: A Large-scale D
 
 Source: **autoPET** challenge — paired whole-body CT + PET NIfTI volumes.
 
-### Preprocessing — `preprocess_autopet.py`
+### Preprocessing — `training/preprocess_autopet.py`
 - Loads `imagesTr/*_0000.nii.gz` (CT) and `*_0001.nii.gz` (PET), `labelsTr/*.nii.gz` (tumor mask).
 - Extracts **brain region**: last 20 % of slices from each volume (paper uses whole-body — this is an intentional scope reduction for CPU compute budget).
 - Resizes each slice to **64 × 64** via `scipy.ndimage.zoom` (paper uses 256 × 256 — intentional reduction).
@@ -34,7 +34,7 @@ The paper's original sequence is **Segmentation (attention) → VQGAN → CPDM**
 ### Stage 1 — Attention-map UNet
 Goal: learn `CT → binary attention mask` (regions where PET will have high SUV uptake). Target derived from PET > 75th-percentile + morphological closing, exactly per paper §4.2.
 
-**Architecture & loss** — `train_attention_map.py`
+**Architecture & loss** — `training/train_attention_map.py`
 - Encoder: ResNet34 + scSE decoder (paper uses ResNet50; smaller backbone chosen for CPU).
 - Loss: 0.7 · Dice + 0.3 · BCE (paper uses pure Dice).
 - Dataset: `datasets/AttentionMapDataset.py` (CT input, attention map generated on the fly from PET).
@@ -57,7 +57,7 @@ Goal: learn `CT → binary attention mask` (regions where PET will have high SUV
 - W&B run: [UNet-AttentionMap-CPU-demo](https://wandb.ai/teamchaspi/CT2PET-AttentionMap/runs/xft9m4va)
 
 ### Stage 2 — Bulk attention-map export
-After UNet training, `export_attention_maps.py` runs inference over **every** CT slice in all three splits and saves a per-slice sigmoid probability map (float32, shape (64, 64), values in [0, 1]) to `data/processed/{split}/AttentionMaps/<slice>.npy`. This is exactly the format `CT2PETDiffusionModel.get_attention_map` reads (threshold 0.5 on load).
+After UNet training, `sampling_eval/export_attention_maps.py` runs inference over **every** CT slice in all three splits and saves a per-slice sigmoid probability map (float32, shape (64, 64), values in [0, 1]) to `data/processed/{split}/AttentionMaps/<slice>.npy`. This is exactly the format `CT2PETDiffusionModel.get_attention_map` reads (threshold 0.5 on load).
 
 | split | maps written |
 |-------|-------------:|
@@ -70,7 +70,7 @@ CPU inference at bs=32 took ~12 min total. Sample stats: range [0, 1], mean ≈ 
 ### Stage 3 — VQGAN encoder/decoder
 Goal: learn `image ↔ 4×16×16 latent` so CPDM can run BB diffusion in latent space.
 
-**Implementation note**. The original repo expects VQGAN to be trained externally with `CompVis/taming-transformers`. No `VQGANRunner` exists in this codebase. Instead we wrote `train_vqgan.py` — a CPU-friendly Lightning wrapper around `model/VQGAN/vqgan.py:VQModel`. Skips perceptual + GAN-discriminator losses (which assumed Lightning 1.x manual optimization); trains on L1 reconstruction + codebook quantization loss only. Saved Lightning checkpoint is keyed identically to `VQModel`, so `CT2PETDiffusionModel.__init__` loads it directly via the existing `VQModel.init_from_ckpt`.
+**Implementation note**. The original repo expects VQGAN to be trained externally with `CompVis/taming-transformers`. No `VQGANRunner` exists in this codebase. Instead we wrote `training/train_vqgan.py` — a CPU-friendly Lightning wrapper around `model/VQGAN/vqgan.py:VQModel`. Skips perceptual + GAN-discriminator losses (which assumed Lightning 1.x manual optimization); trains on L1 reconstruction + codebook quantization loss only. Saved Lightning checkpoint is keyed identically to `VQModel`, so `CT2PETDiffusionModel.__init__` loads it directly via the existing `VQModel.init_from_ckpt`.
 
 **Architecture** — from `config/VQGAN-autoPET.yaml`
 - ddconfig: ch=128, ch_mult=(1, 2, 4), num_res_blocks=2, in_channels=1, out_ch=1, z_channels=4, resolution=64, no attention.
@@ -182,13 +182,13 @@ Interpretation:
 - **SSIM**: tied. SSIM here is dominated by the agreed-upon background.
 - **MAE**: CPDM **loses** to mean-PET by ≈24%. This is expected and informative: a generative model that puts variability into the output (bright spots in plausible places) will occasionally overshoot — every misplaced hotspot costs MAE points compared to a degenerate predictor that just sits on the mean. The fact that MAE is the only metric where the trivial baseline wins, and that PSNR (which also rewards getting hotspots right) shows the largest gap in CPDM's favor, indicates the model is generating PET structure rather than collapsing to a low-variance predictor.
 
-Takeaway: the "mostly-black PET" data is real, but the model is doing more than the data floor — the PSNR gap and the qualitative samples in `report.py` (figure `06_cpdm_samples.png`) confirm it. MAE alone is a misleading metric for this dataset; LPIPS + PSNR together give an honest read.
+Takeaway: the "mostly-black PET" data is real, but the model is doing more than the data floor — the PSNR gap and the qualitative samples in `sampling_eval/report.py` (figure `06_cpdm_samples.png`) confirm it. MAE alone is a misleading metric for this dataset; LPIPS + PSNR together give an honest read.
 
 ## Outstanding / known deviations
 
 1. **CT normalization vs. attenuation formula**. Original code assumed CT in [−1, 1] was produced by `pixel/2047`. Our preprocessor uses an HU-window mapping. Patched `CT2PETDiffusionModel.get_attenuation_map` to invert our normalization (`HU = (ct + 1) · ½ · (3071 − (−1000)) − 1000`) so the closed-form 511 keV LAC sees correct HU values.
 2. **Dataset wiring**. Original `CustomAlignedDataset` expected `{split}/A` (cond) and `{split}/B` (target) layouts and would corrupt pre-normalized inputs by re-applying its own normalization. Replaced with `CT2PETAlignedDataset` (registered as `ct2pet_aligned`) reading `{split}/CT` and `{split}/PET` directly with pass-through values, and supporting a `max_samples` cap per split.
-3. **No VQGAN runner**. Original repo expected external VQGAN training (`CompVis/taming-transformers`). Replaced with `train_vqgan.py` — a Lightning wrapper saving VQModel-compatible checkpoints.
+3. **No VQGAN runner**. Original repo expected external VQGAN training (`CompVis/taming-transformers`). Replaced with `training/train_vqgan.py` — a Lightning wrapper saving VQModel-compatible checkpoints.
 4. **Image size 64 × 64** vs. paper 256 × 256 — intentional, compute budget.
 5. **Brain region only** (last 20 % of each volume) vs. paper whole-body — intentional, compute budget.
 6. **Attention UNet encoder** ResNet34 + 0.7·Dice + 0.3·BCE vs. paper ResNet50 + pure Dice — minor implementation choices, output format unchanged.
@@ -198,20 +198,20 @@ Takeaway: the "mostly-black PET" data is real, but the model is doing more than 
 
 ```bash
 # 1. Preprocess (one-time, ~ minutes)
-python preprocess_autopet.py --raw-dir data/raw/autoPET --output-dir data/processed --target-size 64
+python training/preprocess_autopet.py --raw-dir data/raw/autoPET --output-dir data/processed --target-size 64
 
 # 2. Attention-map UNet (CPU demo: 3 epochs × 200 batches ≈ 6 min)
-python train_attention_map.py --batch-size 8 --max-epochs 3 \
+python training/train_attention_map.py --batch-size 8 --max-epochs 3 \
   --limit-train-batches 200 --limit-val-batches 50 \
   --wandb-name "UNet-AttentionMap-CPU-demo"
 
 # 3. Export sigmoid attention maps for all splits (~12 min)
-python export_attention_maps.py \
+python sampling_eval/export_attention_maps.py \
   --ckpt checkpoints/AttentionMap/attention_map_unet-epoch=02-val_dataset_iou=0.7050.ckpt \
   --data-root data/processed
 
 # 4. VQGAN (CPU; train to convergence or budget)
-python train_vqgan.py --batch-size 4 --max-epochs 5 \
+python training/train_vqgan.py --batch-size 4 --max-epochs 5 \
   --limit-train-batches 500 --limit-val-batches 100 \
   --wandb-name "VQGAN-CPU-full"
 
@@ -220,10 +220,10 @@ python main.py -c config/CPDM-autoPET.yaml -t --gpu_ids -1
 ```
 
 ## Key files
-- `preprocess_autopet.py` — NIfTI → 64 × 64 .npy.
+- `training/preprocess_autopet.py` — NIfTI → 64 × 64 .npy.
 - `datasets/CT2PETAlignedDataset.py` — registered `ct2pet_aligned`, used by VQGAN + CPDM.
-- `datasets/AttentionMapDataset.py` — used by `train_attention_map.py`; generates target on the fly.
-- `train_attention_map.py`, `export_attention_maps.py`, `train_vqgan.py` — standalone Lightning trainers / inference.
+- `datasets/AttentionMapDataset.py` — used by `training/train_attention_map.py`; generates target on the fly.
+- `training/train_attention_map.py`, `sampling_eval/export_attention_maps.py`, `training/train_vqgan.py` — standalone Lightning trainers / inference.
 - `main.py` + `runners/DiffusionBasedModelRunners/CPDMRunner.py` — registry-driven CPDM training entry point.
 - `model/BrownianBridge/CT2PETDiffusionModel.py` — the CPDM diffusion model; modifies attenuation pipeline per Issue #1.
 - `config/{CPDM,VQGAN,AttentionMap-UNet}-autoPET.yaml` — autoPET-specific configs.

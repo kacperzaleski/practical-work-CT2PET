@@ -14,20 +14,35 @@ from scipy.ndimage import zoom, binary_closing, generate_binary_structure
 class AttentionMapDataset(Dataset):
     """
     Dataset for training attention map generation from CT.
-    Generates attention maps from PET (high-uptake regions > 75th percentile).
+
+    Target = **focal high-uptake** mask: PET above an *absolute* SUV threshold
+    (default SUV>2.0). This replaces the old "PET > 75th percentile" rule, which
+    computed the percentile over the *whole* slice — and since only ~25% of the
+    background-cropped frame is body, the 75th percentile landed at the body/air
+    boundary, so the target was effectively the entire body. The UNet learned that
+    trivially (IoU≈0.9) but it carried no localization, so CPDM, conditioned on a
+    body-shaped blob, collapsed to a diffuse central cloud. An absolute SUV cut
+    yields a genuinely focal target (~3% of the frame) that localizes the high-uptake
+    organs/lesions the diffusion must place. See NOTES_BA.md.
+
+    PET on disk is normalized SUV[0,32]→[-1,1], so SUV s ↔ normalized (s/32)*2 − 1.
     """
-    
-    def __init__(self, root_dir, split='train', image_size=64, flip=False):
+
+    PET_SUV_MAX = 32.0  # matches preprocess_autopet PET clip ceiling
+
+    def __init__(self, root_dir, split='train', image_size=64, flip=False, suv_threshold=2.0):
         """
         Args:
             root_dir: Root directory containing processed data (CT/PET/Labels)
             split: One of 'train', 'val', 'test'
             image_size: Target image size (assumes square)
             flip: Apply random horizontal flips
+            suv_threshold: absolute SUV above which a voxel is "high uptake"
         """
         self.root_dir = Path(root_dir) / split
         self.image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.flip = flip and (split == 'train')  # Only flip during training
+        self.suv_threshold = suv_threshold
         
         # Set up directory paths
         self.ct_dir = self.root_dir / 'CT'
@@ -47,12 +62,13 @@ class AttentionMapDataset(Dataset):
     
     def _generate_attention_map(self, pet_slice, threshold=None):
         """
-        Generate attention map from PET slice.
-        Highlights high-uptake regions (>75th percentile).
+        Generate a focal high-uptake attention map from a PET slice.
+        Threshold is an absolute SUV (converted to the [-1,1] normalized scale).
         """
         if threshold is None:
-            threshold = np.percentile(pet_slice, 75)
-        
+            # SUV -> normalized: (suv / SUV_MAX) * 2 - 1
+            threshold = (self.suv_threshold / self.PET_SUV_MAX) * 2.0 - 1.0
+
         attention_map = (pet_slice > threshold).astype(np.float32)
         
         # Apply morphological closing to fill small holes

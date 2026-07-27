@@ -10,6 +10,8 @@ directly. Keys are identical to VQModel, so CPDM can load it via
 model.VQGAN.params.ckpt_path in config/CPDM-autoPET.yaml.
 """
 
+import sys as _sys, pathlib as _pathlib  # repo-root bootstrap (script moved into a subfolder)
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 import argparse
 import os
 import sys
@@ -28,7 +30,8 @@ from model.VQGAN.vqgan import VQModel
 
 
 class VQGANLightning(VQModel):
-    def __init__(self, ddconfig, n_embed, embed_dim, learning_rate=1e-4, print_every=10):
+    def __init__(self, ddconfig, n_embed, embed_dim, learning_rate=1e-4, print_every=10,
+                 perceptual_weight=0.0):
         # VQModel.__init__ does Encoder(**vars(ddconfig)) and instantiate_from_config(vars(lossconfig)),
         # so both must support vars(). Use argparse.Namespace.
         if isinstance(ddconfig, dict):
@@ -43,6 +46,30 @@ class VQGANLightning(VQModel):
         self.print_every = print_every
         self._last_print_t = time.time()
 
+        # Optional VGG-LPIPS perceptual term (improves decode sharpness for CPDM).
+        # Wrapped in a list so it is NOT registered as a submodule: its frozen VGG
+        # weights then stay out of the saved VQGAN state_dict, keeping the ckpt
+        # key-compatible with CT2PETDiffusionModel's VQModel.init_from_ckpt.
+        self.perceptual_weight = float(perceptual_weight)
+        if self.perceptual_weight > 0:
+            import lpips
+            net = lpips.LPIPS(net='vgg')
+            net.eval()
+            for p in net.parameters():
+                p.requires_grad_(False)
+            self._perceptual = [net]
+        else:
+            self._perceptual = []
+
+    def _perceptual_loss(self, x_rec, x):
+        # x, x_rec are single-channel in [-1, 1]; LPIPS wants 3-channel in [-1, 1].
+        net = self._perceptual[0]
+        if next(net.parameters()).device != x.device:
+            net.to(x.device)
+        x3 = x.repeat(1, 3, 1, 1)
+        rec3 = x_rec.clamp(-1, 1).repeat(1, 3, 1, 1)
+        return net(rec3, x3).mean()
+
     def _unpack(self, batch):
         (pet, _), (ct, _) = batch
         return torch.cat([ct, pet], dim=0)
@@ -53,14 +80,20 @@ class VQGANLightning(VQModel):
         x_rec, qloss = self(x)
         rec = F.l1_loss(x_rec, x)
         loss = rec + qloss
-        self.log_dict({'train_rec_loss': rec, 'train_codebook_loss': qloss, 'train_loss': loss},
-                      on_step=True, on_epoch=True, batch_size=x.size(0))
+        logs = {'train_rec_loss': rec, 'train_codebook_loss': qloss}
+        if self.perceptual_weight > 0:
+            perc = self._perceptual_loss(x_rec, x)
+            loss = loss + self.perceptual_weight * perc
+            logs['train_perceptual_loss'] = perc
+        logs['train_loss'] = loss
+        self.log_dict(logs, on_step=True, on_epoch=True, batch_size=x.size(0))
         if batch_idx % self.print_every == 0:
             dt = time.time() - t0
             since = time.time() - self._last_print_t
             self._last_print_t = time.time()
+            perc_str = f' perc={logs["train_perceptual_loss"].detach().item():.4f}' if self.perceptual_weight > 0 else ''
             print(f'[train] e{self.current_epoch} step {batch_idx:5d} '
-                  f'rec={rec.detach().item():.4f} q={qloss.detach().item():.4f} '
+                  f'rec={rec.detach().item():.4f} q={qloss.detach().item():.4f}{perc_str} '
                   f'loss={loss.detach().item():.4f} '
                   f'step_dt={dt:.2f}s window_dt={since:.1f}s',
                   flush=True)
@@ -71,8 +104,13 @@ class VQGANLightning(VQModel):
         x_rec, qloss = self(x)
         rec = F.l1_loss(x_rec, x)
         loss = rec + qloss
-        self.log_dict({'val_rec_loss': rec, 'val_codebook_loss': qloss, 'val_loss': loss},
-                      on_epoch=True, sync_dist=True, batch_size=x.size(0))
+        logs = {'val_rec_loss': rec, 'val_codebook_loss': qloss}
+        if self.perceptual_weight > 0:
+            perc = self._perceptual_loss(x_rec, x)
+            loss = loss + self.perceptual_weight * perc
+            logs['val_perceptual_loss'] = perc
+        logs['val_loss'] = loss
+        self.log_dict(logs, on_epoch=True, sync_dist=True, batch_size=x.size(0))
         return loss
 
     def on_validation_epoch_end(self):
@@ -106,6 +144,12 @@ def main():
                         help='Override base channel count from YAML (smaller = faster on CPU).')
     parser.add_argument('--print-every', type=int, default=10)
     parser.add_argument('--log-every-n-steps', type=int, default=20)
+    parser.add_argument('--perceptual-weight', type=float, default=None,
+                        help='Weight of the VGG-LPIPS perceptual term (0 = off). '
+                             'Falls back to training.perceptual_weight in the YAML, else 0.')
+    parser.add_argument('--resume-ckpt', type=str, default=None,
+                        help='Resume training from a Lightning .ckpt (restores model + '
+                             'optimizer + epoch). Use checkpoints/VQGAN_128/last.ckpt to continue.')
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -141,12 +185,20 @@ def main():
         ddconfig['ch'] = int(args.ch)
         print(f'[init] overriding base channel count to {args.ch}', flush=True)
 
+    if args.perceptual_weight is not None:
+        perceptual_weight = args.perceptual_weight
+    else:
+        perceptual_weight = float(cfg.get('training', {}).get('perceptual_weight', 0.0))
+    if perceptual_weight > 0:
+        print(f'[init] perceptual (VGG-LPIPS) term enabled, weight={perceptual_weight}', flush=True)
+
     model = VQGANLightning(
         ddconfig=ddconfig,
         n_embed=int(vq_params['n_embed']),
         embed_dim=int(vq_params['embed_dim']),
         learning_rate=1e-4,
         print_every=args.print_every,
+        perceptual_weight=perceptual_weight,
     )
 
     wandb_logger = WandbLogger(
@@ -160,6 +212,7 @@ def main():
         'max_epochs': args.max_epochs,
         'limit_train_batches': args.limit_train_batches,
         'limit_val_batches': args.limit_val_batches,
+        'perceptual_weight': perceptual_weight,
         'dataset_sizes': {'train': len(train_ds), 'val': len(val_ds)},
     })
 
@@ -170,6 +223,9 @@ def main():
         mode='min',
         save_top_k=2,
         save_last=True,
+        # Overwrite last.ckpt / same-epoch files in place instead of spawning
+        # last-v1.ckpt, last-v2.ckpt ... so resume always points at one file.
+        enable_version_counter=False,
     )
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
@@ -191,8 +247,11 @@ def main():
         limit_val_batches=_parse_limit(args.limit_val_batches),
     )
 
+    if args.resume_ckpt:
+        print(f'Resuming from {args.resume_ckpt}', flush=True)
     print('Starting VQGAN training...')
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader,
+                ckpt_path=args.resume_ckpt)
     print(f'Best ckpt: {checkpoint_cb.best_model_path}')
     print(f'Last ckpt: {checkpoint_dir}/last.ckpt')
 

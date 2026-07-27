@@ -3,6 +3,8 @@ Dataset validation and statistics utilities.
 Check data integrity and provide statistics about the processed dataset.
 """
 
+import sys as _sys, pathlib as _pathlib  # repo-root bootstrap (script moved into a subfolder)
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 import os
 import json
 import numpy as np

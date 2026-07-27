@@ -58,6 +58,13 @@ class CPDMRunner(DiffusionBaseRunner):
         self._es_patience = int(getattr(es, 'patience', 0)) if es is not None else 0
         self._es_min_delta = float(getattr(es, 'min_delta', 0.0)) if es is not None else 0.0
         self._es_enabled = self._es_patience > 0
+        # Metric-keyed checkpoint selection. The paper metrics are already computed every
+        # validation epoch, so selecting on them costs one extra torch.save per improvement
+        # (no extra forward passes). Kept separately from top_model_*, which tracks the latent
+        # val loss; the latent loss can keep falling for many epochs after SSIM/LPIPS have
+        # turned, so best-by-latent-loss is not the best-by-image-quality checkpoint.
+        self._best_metric_ssim = float('-inf')   # higher is better
+        self._best_metric_lpips = float('inf')   # lower is better
 
     def _maybe_attach_wandb(self, config):
         """
@@ -200,7 +207,8 @@ class CPDMRunner(DiffusionBaseRunner):
             avg_l = None
 
         # Paper metrics on a small fixed val subset, every epoch.
-        self._evaluate_paper_metrics(val_loader, epoch)
+        means = self._evaluate_paper_metrics(val_loader, epoch)
+        self._save_metric_keyed_checkpoints(means, epoch)
 
         if self._es_enabled and avg_l is not None and math.isfinite(avg_l):
             if avg_l < self._best_val_loss - self._es_min_delta:
@@ -219,6 +227,35 @@ class CPDMRunner(DiffusionBaseRunner):
                       f'(best val loss {self._best_val_loss:.5f}); '
                       f'capping n_steps={self.config.training.n_steps}')
         return average_loss
+
+    @torch.no_grad()
+    def _save_metric_keyed_checkpoints(self, means, epoch):
+        """
+        Save best-by-SSIM and best-by-LPIPS model checkpoints, using the metrics already
+        computed this validation epoch (no extra sampling). Only the model weights are written
+        (optimizer/scheduler state is not needed for evaluation), and each file is overwritten
+        in place so at most two extra checkpoints exist. Rank-0 only, mirroring the other saves.
+        """
+        if means is None:
+            return
+        if self.config.training.use_DDP and self.config.training.local_rank != 0:
+            return
+        ckpt_dir = self.config.result.ckpt_path
+        ssim = means.get('ssim')
+        lpips = means.get('lpips')
+
+        def _save(tag):
+            model_states, _ = self.get_checkpoint_states(stage='epoch_end')
+            torch.save(model_states, os.path.join(ckpt_dir, f'best_{tag}_model.pth'))
+
+        if ssim is not None and math.isfinite(ssim) and ssim > self._best_metric_ssim:
+            self._best_metric_ssim = ssim
+            _save('ssim')
+            print(f'[metric-ckpt] epoch={epoch} new best SSIM={ssim:.4f} -> best_ssim_model.pth', flush=True)
+        if lpips is not None and math.isfinite(lpips) and lpips < self._best_metric_lpips:
+            self._best_metric_lpips = lpips
+            _save('lpips')
+            print(f'[metric-ckpt] epoch={epoch} new best LPIPS={lpips:.4f} -> best_lpips_model.pth', flush=True)
 
     def initialize_model(self, config):
         if config.model.model_type == "BBDM":

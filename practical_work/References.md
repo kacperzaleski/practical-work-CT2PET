@@ -32,8 +32,9 @@ Ho, J., Jain, A., & Abbeel, P. (2020). **Denoising Diffusion Probabilistic Model
 ### Iakubovskii, 2019 — segmentation_models.pytorch
 Iakubovskii, P. (2019). *Segmentation Models PyTorch*. GitHub repository: <https://github.com/qubvel-org/segmentation_models.pytorch>. Used at version 0.5.
 
-### Isola et al., 2017 — pix2pix
-Isola, P., Zhu, J.-Y., Zhou, T., & Efros, A. A. (2017). **Image-to-Image Translation with Conditional Adversarial Networks**. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition* (CVPR), pp. 1125–1134. arXiv: 1611.07004.
+### Jeblick et al., 2024 — autoPET III PSMA-PET/CT cohort
+Jeblick, K., Schachtner, B., Mittermeier, A., Dexl, J., Wesp, P., Küstner, T., Gatidis, S., Früh, M., Fabritius, M., Unterrainer, L., Sheikh, G., Delker, A., Böning, G., Brendel, M., Ricke, J., Werner, R., Gu, S., Ingrisch, M., Geyer, T., & Cyran, C. (2024). **A whole-body PSMA-PET/CT dataset with manually annotated tumor lesions (PSMA-PET-CT-Lesions)** [Dataset]. *The Cancer Imaging Archive*. DOI: 10.7937/r7ep-3x37. PSMA cohort (LMU Munich, 597 studies) of the autoPET III challenge, MICCAI 2024.
+*Note: verify the full author list/spellings against the TCIA record before formal submission.*
 
 ### Kingma & Ba, 2015 — Adam optimizer
 Kingma, D. P., & Ba, J. (2015). **Adam: A Method for Stochastic Optimization**. *International Conference on Learning Representations* (ICLR). arXiv: 1412.6980.
@@ -41,17 +42,16 @@ Kingma, D. P., & Ba, J. (2015). **Adam: A Method for Stochastic Optimization**. 
 ### Kingma & Welling, 2014 — VAE
 Kingma, D. P., & Welling, M. (2014). **Auto-Encoding Variational Bayes**. *International Conference on Learning Representations* (ICLR). arXiv: 1312.6114.
 
-### Li et al., 2023 — BBDM ⚠️ verify authors
+### Li et al., 2023 — BBDM
 Li, B., Xue, K., Liu, B., & Lai, Y.-K. (2023). **BBDM: Image-to-Image Translation with Brownian Bridge Diffusion Models**. *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition* (CVPR). arXiv: 2205.07680.
-*Note: confirm author list and page numbers against the CVPR 2023 proceedings page; the project page is <https://github.com/xuekt98/BBDM>.*
+
 
 ### Milletari et al., 2016 — V-Net / Dice loss
 Milletari, F., Navab, N., & Ahmadi, S.-A. (2016). **V-Net: Fully Convolutional Neural Networks for Volumetric Medical Image Segmentation**. *Fourth International Conference on 3D Vision* (3DV), pp. 565–571. arXiv: 1606.04797.
 
-### Nguyen et al., 2025 — CPDM ⚠️ verify
-Nguyen, D. H. *et al.* (2025). **CT to PET Translation: A Large-Scale Dataset and Domain-Knowledge-Guided Diffusion Approach**. *Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision* (WACV).
+### Nguyen et al., 2025 — CPDM
+Nguyen, D. T., Nguyen, T. T., Nguyen, H. T., Nguyen, T. T., Pham, H. H., Nguyen, T. H., Truong, T. N., & Nguyen, P. L. (2025). **CT to PET Translation: A Large-Scale Dataset and Domain-Knowledge-Guided Diffusion Approach**. *Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision* (WACV). arXiv: 2410.21932.
 PDF: <https://openaccess.thecvf.com/content/WACV2025/papers/Nguyen_CT_to_PET_Translation_A_Large-Scale_Dataset_and_Domain-Knowledge-Guided_Diffusion_WACV_2025_paper.pdf>. GitHub: <https://github.com/thanhhff/CPDM>.
-*Note: confirm the full author list, page numbers, and DOI against the WACV 2025 proceedings record.*
 
 ### Paszke et al., 2019 — PyTorch
 Paszke, A. *et al.* (2019). **PyTorch: An Imperative Style, High-Performance Deep Learning Library**. *Advances in Neural Information Processing Systems* (NeurIPS) **32**. arXiv: 1912.01703.
@@ -74,8 +74,8 @@ Sohl-Dickstein, J., Weiss, E. A., Maheswaranathan, N., & Ganguli, S. (2015). **D
 ### Song et al., 2021 — score-based diffusion
 Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A., Ermon, S., & Poole, B. (2021). **Score-Based Generative Modeling through Stochastic Differential Equations**. *International Conference on Learning Representations* (ICLR). arXiv: 2011.13456.
 
-### Song et al., 2022 — DDIM
-Song, J., Meng, C., & Ermon, S. (2022). **Denoising Diffusion Implicit Models**. *International Conference on Learning Representations* (ICLR). arXiv: 2010.02502.
+### Song et al., 2021 — DDIM
+Song, J., Meng, C., & Ermon, S. (2021). **Denoising Diffusion Implicit Models**. *International Conference on Learning Representations* (ICLR). arXiv: 2010.02502.
 
 ### van den Oord et al., 2017 — VQ-VAE
 van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). **Neural Discrete Representation Learning**. *Advances in Neural Information Processing Systems* (NeurIPS) **30**, pp. 6306–6315. arXiv: 1711.00937.
@@ -89,14 +89,14 @@ Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). **Image Quali
 ### Zhang et al., 2018 — LPIPS
 Zhang, R., Isola, P., Efros, A. A., Shechtman, E., & Wang, O. (2018). **The Unreasonable Effectiveness of Deep Features as a Perceptual Metric**. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition* (CVPR), pp. 586–595. arXiv: 1801.03924.
 
-### Zhu et al., 2017 — CycleGAN
-Zhu, J.-Y., Park, T., Isola, P., & Efros, A. A. (2017). **Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks**. *IEEE International Conference on Computer Vision* (ICCV), pp. 2223–2232. arXiv: 1703.10593.
-
 ---
 
 ## Referenced indirectly (in `Proposal.md`, future-work directions)
 
 These appear in the thesis-extension proposals but not in the experimental protocol. Included here so the bibliography file is complete for thesis use.
+
+### Zhu et al., 2017 — CycleGAN
+Zhu, J.-Y., Park, T., Isola, P., & Efros, A. A. (2017). **Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks**. *IEEE International Conference on Computer Vision* (ICCV), pp. 2223–2232. arXiv: 1703.10593.
 
 ### Karras et al., 2022 — EDM
 Karras, T., Aittala, M., Aila, T., & Laine, S. (2022). **Elucidating the Design Space of Diffusion-Based Generative Models**. *Advances in Neural Information Processing Systems* (NeurIPS) **35**. arXiv: 2206.00364.

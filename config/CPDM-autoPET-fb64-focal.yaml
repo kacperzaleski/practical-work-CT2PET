@@ -1,0 +1,189 @@
+# CPDM — focal-attention FINE-TUNE variant of config/CPDM-autoPET-fb64.yaml.
+#
+# Identical architecture/data to the blob config; the ONLY differences are:
+#   - model_name: CPDM_focal  -> results land in results/CT2PET_autoPET_fullbody/CPDM_focal/
+#     so the original blob CPDM run (results/.../CPDM/) is fully preserved as a fallback.
+#   - attention_map_{train,val}_path -> .../AttentionMaps_focal (the new focal-SUV>2.0 maps),
+#     so the old blob maps in .../AttentionMaps/ are preserved untouched.
+#   - EMA start_ema_step 30000 -> 5000 (the blob run reached only step 16875, so EMA never
+#     engaged; a fine-tune resumes at step 16875 so EMA averaging starts immediately).
+#   - early_stopping patience 15 -> 25 (give the fine-tune room to adapt to new conditioning).
+#
+# Launch (fine-tune from the epoch-27 blob weights, FRESH optimizer = no --resume_optim):
+#   python main.py -c config/CPDM-autoPET-fb64-focal.yaml -t --gpu_ids -1 \
+#       --resume_model results/CT2PET_autoPET_fullbody/CPDM/checkpoint/last_model.pth
+# Fallback to the usual blob training: use config/CPDM-autoPET-fb64.yaml + the preserved
+# results/.../CPDM/checkpoint + .../AttentionMaps/ (see NOTES_BA.md §11).
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'ct2pet_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+
+    image_size: 64
+    channels: 1
+
+    to_normal: True
+    flip: True
+
+    max_pixel_cond: 1.0
+    max_pixel_ori: 1.0
+
+    max_samples:
+      train: 5000
+      val: 800
+      test: 256
+
+  train:
+    batch_size: 8
+    shuffle: True
+    num_workers: 4
+
+  val:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+  test:
+    batch_size: 8
+    shuffle: False
+    num_workers: 2
+
+model:
+  VQGAN:
+    ckpt_path: null
+    params:
+      ddconfig:
+        attn_resolutions: []
+        ch: 128
+        ch_mult: !!python/tuple [1, 2, 4]
+        double_z: False
+        dropout: 0.0
+        in_channels: 1
+        out_ch: 1
+        num_res_blocks: 2
+        resolution: 64
+        z_channels: 4
+
+      embed_dim: 4
+      n_embed: 8192
+
+      lossconfig:
+        target: torch.nn.Identity
+
+      ckpt_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/VQGAN_fb64/last.ckpt'
+
+  BB:
+    lr_scheduler:
+      cooldown: 3000
+      factor: 0.5
+      min_lr: 5.0e-07
+      patience: 3000
+      threshold: 0.0001
+
+    optimizer:
+      beta1: 0.9
+      lr: 0.0001
+      optimizer: Adam
+      weight_decay: 0.0
+
+    params:
+      UNetParams:
+        attention_resolutions: !!python/tuple [8, 4]
+        channel_mult: !!python/tuple [1, 2, 3, 4]
+        condition_key: SpatialRescaler
+        context_dim: null
+        conv_resample: True
+        dims: 2
+        image_size: 16
+        in_channels: 12
+        model_channels: 128
+        num_head_channels: 64
+        num_heads: 8
+        num_res_blocks: 2
+        out_channels: 4
+        resblock_updown: True
+        use_scale_shift_norm: True
+        use_spatial_transformer: False
+
+      eta: 1.0
+      loss_type: l1
+      max_var: 1.0
+      mt_type: linear
+      num_timesteps: 1000
+      objective: grad
+      sample_step: 200
+      sample_type: linear
+      skip_sample: True
+
+  CondStageParams:
+    in_channels: 1
+    n_stages: 2
+    out_channels: 4
+
+  EMA:
+    ema_decay: 0.995
+    start_ema_step: 5000
+    update_ema_interval: 8
+    use_ema: True
+
+  AttentionMapSegmentation:
+    model_type: UNet
+    in_channels: 1
+    out_channels: 1
+    features: [64, 128, 256, 512]
+    dropout_rate: 0.1
+
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+
+  # Focal-SUV>2.0 attention maps (exported to AttentionMaps_focal; blob maps preserved).
+  attention_map_train_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/train/AttentionMaps_focal'
+  attention_map_val_path: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody/val/AttentionMaps_focal'
+
+  model_name: CPDM_focal
+  model_type: CPDM
+
+runner: CPDMRunner
+
+training:
+  accumulate_grad_batches: 1
+  n_epochs: 100
+  n_steps: 200000
+
+  sample_interval: 100
+  save_interval: 1
+  validation_interval: 1
+
+  log_interval: 50
+
+  use_amp: False
+  grad_clip: 1.0
+
+  early_stopping:
+    patience: 25
+    min_delta: 0.0005
+
+testing:
+  clip_denoised: False
+  sample_num: 1
+  metrics_eval_max_batches: 2
+  metrics:
+    - lpips
+    - mae
+    - ssim
+    - psnr
+
+paths:
+  results_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/results/CPDM_fb64_focal'
+  checkpoint_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/CPDM_fb64_focal'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/CPDM_fb64_focal'
+
+wandb:
+  project: 'CT2PET-CPDM'
+  entity: null
+  name: 'CPDM-focal-finetune-SUV2.0'
+  notes: 'CPDM fine-tuned from epoch-27 blob weights on focal-SUV>2.0 attention maps (fresh optimizer, EMA engaged)'
+  log_frequency: 100

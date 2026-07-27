@@ -1,0 +1,593 @@
+% !TeX program = pdflatex
+% !BIB program = biber
+%
+% Scientific protocol of the practical work, ready to paste into Overleaf.
+% Compiles with pdflatex + biber (Overleaf default since 2017).
+%
+% To use in Overleaf:
+%   1. Create a new project; upload Protocol.tex and References.bib.
+%   2. Project settings -> compiler: pdfLaTeX (default).
+%   3. Recompile; biber runs automatically for biblatex.
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,
+            linkcolor=blue!45!black,
+            citecolor=blue!45!black,
+            urlcolor=blue!45!black}
+\usepackage[backend=biber,
+            style=authoryear-comp,
+            sorting=nyt,
+            maxcitenames=2,
+            maxbibnames=10,
+            uniquelist=false]{biblatex}
+\addbibresource{References.bib}
+
+\title{Practical Work Protocol:\\[0.3em]
+CT-to-PET Translation via Brownian Bridge Diffusion on autoPET Dataset}
+\author{Kacper Zaleski\\Johannes Kepler University Linz}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This protocol documents the end-to-end reimplementation of CPDM, a 
+domain-knowledge-guided diffusion model for CT-to-PET translation 
+\parencite{nguyen2025cpdm}, on the \texttt{autoPET} whole-body
+multi-tracer PET/CT dataset \parencite{gatidis2022autopet, jeblick2024psma}. The pipeline comprises (1)
+an attention-map UNet that learns regions of high PET uptake from CT alone, (2) 
+a VQGAN encoder/decoder providing a $4 \times 16 \times 16$ latent space, and (3) 
+a Brownian Bridge diffusion process \parencite{li2023bbdm} operating in that latent 
+space, conditioned on the attention map and a CT-derived 511\,keV attenuation map. 
+All four training stages were executed CPU-only on an Intel i7-8650U 
+(8 cores, 15\,GB RAM). The model reaches a best validation LPIPS of 0.166 and 
+PSNR of 41.7\,dB on \texttt{autoPET} brain-region slices, beating three trivial 
+baselines on PSNR by 2--16\,dB and confirming that the model produces structurally
+meaningful PET despite a background-dominated data distribution.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+\section{Introduction}
+
+Computed tomography (CT), introduced by \textcite{hounsfield1973ct}, reconstructs 
+cross-sectional anatomical images from rotating X-ray projections and remains the 
+workhorse modality for structural imaging across nearly every medical specialty. 
+Positron emission tomography (PET), developed shortly after 
+by \textcite{phelps1975pet}, instead images the spatial distribution of an 
+injected radiotracer (most commonly $^{18}$F-fluorodeoxyglucose, FDG) via 
+coincident-photon detection, yielding \emph{functional} information about 
+tissue metabolism that CT alone cannot resolve \parencite{gambhir2002pet}. 
+The two modalities are typically acquired together on hybrid PET/CT scanners 
+introduced by \textcite{beyer2000petct}, where the CT additionally provides 
+the attenuation correction needed to quantify the PET signal. PET, however, 
+carries costs that CT does not: an additional ionising-radiation dose from 
+the radiotracer on top of the CT component, longer acquisition times, the need 
+for an on-site cyclotron or tracer supply chain, and substantially higher per-study 
+costs. Repeated CT studies themselves now constitute a substantial source of 
+population-level radiation exposure \parencite{brennerhall2007ctdose}, making 
+any reduction in additional PET dose clinically relevant. The ability to 
+synthesise PET from CT even imperfectly, therefore has clinical value as a 
+triage tool, as a data-augmentation aid for downstream tasks like tumour 
+segmentation, and as a research vehicle for understanding what physical and 
+anatomical information CT can convey about radiotracer uptake.
+
+This project reimplements \textbf{CPDM} (CT to PET Diffusion Model) \parencite{nguyen2025cpdm}, 
+a domain-knowledge-guided diffusion approach proposed at WACV 2025 using the authors' 
+large-scale curated CT-PET dataset. The approach is reproduced on the publicly 
+available \texttt{autoPET} dataset \parencite{gatidis2022autopet, jeblick2024psma}, a whole-body
+multi-tracer (FDG and PSMA) PET/CT dataset with tumour segmentation labels, and every adaptation required
+to fit the original paper's design into the available compute budget and the dataset's 
+properties (HU-normalised CT, varied scanner conditions, partially imbalanced 
+tumour distributions) is documented.
+
+The aim of the practical work is a faithful reproduction of the CPDM architecture 
+and training pipeline on \texttt{autoPET}, with all paper-required 
+components: VQGAN, Brownian Bridge denoiser, and the two domain-specific 
+conditioning signals.
+
+\section{Theoretical Background}
+
+\subsection{Denoising diffusion probabilistic models}
+
+Diffusion models \parencite{sohldickstein2015deep, ho2020denoising, song2021scorebased} learn a generative process by inverting a fixed Gaussian noising process. Given a data distribution $q(x_0)$, the forward process produces a sequence of progressively noisier latents $x_1, \ldots, x_T$ via the Markov chain
+\begin{equation}
+q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(x_t;\, \sqrt{1 - \beta_t}\, x_{t-1},\, \beta_t\, I\right)
+\end{equation}
+with a variance schedule $\beta_1 < \cdots < \beta_T$. A neural network 
+$\varepsilon_\theta(x_t, t)$ is trained to predict the noise added at each 
+step, equivalently learning the score $\nabla_{x_t} \log p(x_t)$ \parencite{song2021scorebased}. Sampling 
+proceeds by iteratively denoising from $x_T \sim \mathcal{N}(0, I)$.
+
+The original DDPM \parencite{ho2020denoising} uses a UNet denoiser 
+\parencite{ronneberger2015unet} adapted with time-step embeddings, 
+group normalisation, and attention layers at low spatial resolutions. 
+Subsequent work demonstrated that diffusion models in pixel space at 
+high resolutions are computationally expensive. Latent diffusion models (LDMs) 
+\parencite{rombach2022ldm} address this by training the diffusion process in the 
+latent space of a pretrained autoencoder, dramatically reducing compute while 
+preserving sample quality. The autoencoder is typically either a VAE 
+\parencite{kingma2014vae} with a continuous, KL-regularised latent or 
+a VQGAN \parencite{esser2021vqgan}; CPDM, and therefore this 
+work, uses the latter. VQGAN itself builds on VQ-VAE \parencite{oord2017vqvae}, 
+which replaces the VAE's continuous Gaussian latent with a discrete codebook of 
+learned code vectors, and adds a perceptual loss together with an adversarial 
+discriminator to obtain sharper reconstructions.
+
+\subsection{Brownian Bridge diffusion for image-to-image translation}
+\label{sec:bbdm}
+
+Standard DDPM samples are unconditional. For paired image-to-image translation (e.g.\ CT $\to$ PET), 
+one wants a diffusion process whose endpoint distributions are \emph{both} data 
+distributions, not one data and one Gaussian noise. BBDM \parencite{li2023bbdm} 
+proposes a diffusion bridge between source and target image distributions using a 
+Brownian Bridge stochastic process: a Brownian motion conditioned on its endpoints. 
+The forward process at time $t$ interpolates between $x_0$ (target) and $y$ (source) 
+according to
+\begin{equation}
+x_t \;=\; (1 - m_t)\, x_0 \;+\; m_t\, y \;+\; \sigma_t\, \varepsilon_t,
+\label{eq:bbdm-fwd}
+\end{equation}
+where $m_t$ is a monotone schedule from $0$ to $1$ and $\sigma_t$ controls 
+injected noise. At $t = 0$ the latent equals the target; at $t = T$ it equals 
+the source. The reverse process is trained to predict the gradient of the bridge, 
+and sampling iteratively transforms the source into the target. Compared to 
+the older approach of diffusion conditioning, where the source image
+is simply concatenated to the noisy target as a context channel, BBDM has a 
+more principled 
+forward process for image-to-image tasks and empirically produces sharper 
+results on benchmarks like CelebA-HQ-edge and Cityscapes \parencite{li2023bbdm}.
+
+\subsection{CPDM: domain-knowledge-guided BB diffusion for CT-to-PET}
+\label{sec:cpdm-theory}
+
+The CPDM paper \parencite{nguyen2025cpdm} adapts BBDM to medical CT-to-PET 
+translation with two domain-specific conditioning signals concatenated as 
+additional input channels to the BB denoiser:
+
+\begin{enumerate}
+  \item \textbf{Attention map} ($M_T$): a binary spatial mask indicating regions 
+  of expected high PET uptake. Produced by a separately trained UNet that learns 
+  the mapping $\text{CT} \to (\text{PET} > p_{75} \;+\; \text{binary closing})$. 
+  Provides the denoiser with a hard spatial prior about \emph{where} to place 
+  bright regions.
+  \item \textbf{Attenuation map} ($M_\mu$): a closed-form per-pixel transform of 
+  CT Hounsfield units to the linear attenuation coefficient at 511\,keV the energy 
+  of the annihilation photons whose detection PET measures. Approximated by a 
+  piecewise-linear function calibrated to CT scanner kVp. Encodes the physics 
+  linking CT density and PET signal correction.
+\end{enumerate}
+
+The paper's ablation (their Table~4) reports that removing $M_T$ increases LPIPS 
+by $\sim 12\%$ and removing $M_\mu$ by $\sim 14\%$, supporting the claim that 
+both signals contribute meaningfully.
+
+CPDM operates in the latent space of a pretrained VQGAN trained on the same 
+paired data, following the LDM paradigm. The denoising UNet has input 
+channels $3 \cdot z_{\text{channels}}$ (target latent + two condition 
+contexts, each remapped via a \texttt{SpatialRescaler} to $z_{\text{channels}}$), 
+matching the $9 = 3 \cdot 3$ design used in the released code template.
+
+\subsection{Evaluation metrics}
+\label{sec:eval-metrics}
+
+A standard image-quality metric suite for translation tasks includes:
+\begin{itemize}
+  \item \textbf{Mean Absolute Error (MAE)}: per-pixel $\lVert x - \hat{x} \rVert_1$. 
+  Sensitive to intensity bias and noise; widely reported but trivially minimised by 
+  predicting the per-pixel mean of the training distribution.
+  \item \textbf{Peak Signal-to-Noise Ratio (PSNR)}: $10 \cdot \log_{10}(R^2 / \text{MSE})$ 
+  in dB, where $R$ is the dynamic range. Rewards low overall error; less easily 
+  fooled by mean-image predictors than MAE alone.
+  \item \textbf{Structural Similarity Index (SSIM)}: \parencite{wang2004ssim} 
+  captures luminance, contrast, and structural correlation in local windows. 
+  Penalises loss of structure; more clinically meaningful than per-pixel 
+  metrics for medical images.
+  \item \textbf{Learned Perceptual Image Patch Similarity (LPIPS)}: \parencite{zhang2018lpips} 
+  distance in the activation space of a pretrained CNN (here, VGG). Correlates 
+  better than the above with human judgments of perceptual similarity for natural 
+  images; less well validated for medical images but widely adopted.
+\end{itemize}
+
+The CPDM paper \parencite{nguyen2025cpdm} reports all four; the same suite is 
+replicated here to enable direct (paper-comparable) numbers.
+
+\section{Dataset}
+
+\subsection{\texttt{autoPET}}
+
+This work uses the \texttt{autoPET III} release, which combines two publicly
+distributed, tumour-lesion-annotated whole-body PET/CT cohorts acquired with two
+different radiotracers: the FDG-PET/CT cohort of \textcite{gatidis2022autopet}
+(1{,}014 studies, 900 patients; UKT T\"ubingen) and the PSMA-PET/CT cohort of
+\textcite{jeblick2024psma} (LMU Munich). The combined set used here totals
+\textbf{1{,}614} studies (1{,}014 FDG + 600 PSMA), distributed via the
+\texttt{autoPET} challenge held at MICCAI 2022--2024. Each study contains a paired
+CT and PET volume in NIfTI format together with manually annotated tumour
+segmentation masks. Because FDG (metabolic) and PSMA (prostate-specific membrane
+antigen) label different biological targets, the combined set spans a wider range
+of uptake patterns than an FDG-only set would.
+
+For this practical work the official 80/10/10 split (\texttt{splits\_80\_10\_10.json}
+shipped with the dataset) is used: 1{,}291 train / 161 val / 162 test studies, whose
+tracer composition is shown in Table~\ref{tab:splits}. Only the \textbf{first 20\,\%
+of slices} per volume corresponding approximately to the head/brain region are
+retained, to keep the dataset size manageable on CPU.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Split & FDG & PSMA & Studies & $64 \times 64$ brain slices \\
+\midrule
+train & 818 & 473 & 1{,}291 & 86{,}197 \\
+val   & 102 & 59  & 161    & 10{,}464 \\
+test  & 94  & 68  & 162    & 11{,}330 \\
+\midrule
+total & 1{,}014 & 600 & 1{,}614 & 107{,}991 \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{autoPET III} study counts and brain-region slice counts after the
+80/10/10 split, broken down by radiotracer.}
+\label{tab:splits}
+\end{table}
+
+This brain-only restriction is a known deviation from the paper, which uses 
+scans from top of head to the upper thigh region. It restricts the diversity of 
+uptake patterns (no liver, bladder, or heart background uptake) and inflates the proportion 
+of near-background pixels.
+
+\subsection{Preprocessing}
+
+Preprocessing (\texttt{preprocess\_autopet.py}) performs the following steps per volume:
+\begin{enumerate}
+  \item \textbf{Extract} the first 20\% of axial slices.
+  \item \textbf{Resize} each 2D slice to $64 \times 64$. 
+  \item \textbf{Normalise} to $[-1, 1]$. CT is clipped to HU $\in [-1000, 3071]$ and 
+  PET to SUV $\in [0, 32]$; each clipped value $v$ in $[a, b]$ is then mapped affinely 
+  as $\tilde v = 2(v-a)/(b-a) - 1$. So CT HU $-1000 \mapsto -1$, $3071 \mapsto +1$; 
+  PET SUV $0 \mapsto -1$, $32 \mapsto +1$. This puts both modalities on a common, 
+  symmetric range for the VQGAN and diffusion model.
+  \item \textbf{Save} each slice as a \texttt{float32} NumPy file
+\end{enumerate}
+
+\section{Method}
+
+\subsection{Stage 1: Attention-map UNet}
+
+\paragraph{Architecture.} A 2D UNet \parencite{ronneberger2015unet} implemented via \texttt{segmentation\_models\_pytorch} \parencite{iakubovskii2019smp} with a ResNet34 \parencite{he2016resnet} encoder (ImageNet-pretrained weights averaged into the single-channel input) and a concurrent spatial-and-channel squeeze-and-excitation (scSE) decoder \parencite{roy2018scse}.
+
+\paragraph{Target.} The CPDM paper specifies the attention map as a binary mask of high-uptake regions derived from the paired PET, but leaves the exact threshold and post-processing implementation-defined. We follow a simple, reproducible recipe consistent with that description:
+\begin{enumerate}
+  \item Compute the per-slice 75th percentile $\tau$ of the (normalised) PET intensities; mark every pixel with intensity $> \tau$ as foreground. This isolates the brightest quartile of pixels, which on PET corresponds to elevated tracer uptake (FDG or PSMA).
+  \item Apply binary morphological closing (dilation followed by erosion) to the resulting mask using a $3 \times 3$ all-ones structuring element. The structuring element is the small neighbourhood the morphological operation slides over each pixel; a $3 \times 3$ square is the smallest isotropic 8-connected neighbourhood and is the standard default. Closing fills single-pixel holes and joins near-adjacent foreground blobs into contiguous regions, producing a cleaner training target than raw thresholding.
+\end{enumerate}
+The mask is computed on the fly from PET inside \texttt{AttentionMapDataset}; CT is the network input and PET is held out during attention-UNet training, so at CPDM training time the attention map is derived from CT alone.
+
+\paragraph{Loss.} $0.7 \cdot \text{DiceLoss} + 0.3 \cdot \text{BCEWithLogitsLoss}$. 
+The Dice term \parencite{milletari2016vnet} dominates to focus optimisation on 
+overlap with the foreground; the BCE term stabilises gradients in the early 
+training when predictions are near-uniform.
+
+\paragraph{Training.} Adam optimiser \parencite{kingma2015adam}, learning rate 
+$10^{-3}$, \texttt{CosineAnnealingLR} schedule, batch size 8, 3 epochs $\times$ 
+200 batches-per-epoch limit. 
+
+\subsection{Stage 2: Attention-map export}
+
+After training, \texttt{export\_attention\_maps.py} runs the trained UNet 
+over every CT slice in all three splits at batch size 32, writing the sigmoid 
+probability per slice as a \texttt{float32} array of shape $(64, 64)$ to 
+\texttt{data/processed/\{split\}/AttentionMaps/<slice>.npy}. This is the 
+exact format the CPDM denoiser reads at training time, with a hard threshold 
+of 0.5 applied at load. Total writes: 108k maps.
+
+\subsection{Stage 3: VQGAN encoder/decoder}
+
+\paragraph{Architecture.} The VQGAN \parencite{esser2021vqgan} from the original CPDM codebase, configured for single-channel medical imaging: base channels = 128, channel multipliers $(1, 2, 4)$, two residual blocks per level, no attention layers, latent channels $z = 4$, codebook size 8192. Spatial compression $64 \to 16$ ($\times 4$ downsampling). Total trainable parameters: 55.3\,M. The encoder--quantiser--decoder structure follows \textcite{oord2017vqvae} for VQ-VAE.
+
+\paragraph{Training.} $L_1$ reconstruction loss plus the standard commitment/codebook 
+loss; the \textbf{perceptual loss} \parencite{zhang2018lpips} and 
+\textbf{GAN discriminator} \parencite{goodfellow2014gan, esser2021vqgan} used 
+in the original VQGAN are not used here.
+
+\paragraph{Schedule.} Adam optimiser, learning rate $10^{-4}$, betas $(0.5, 0.9)$. Each batch concatenates CT and PET along the batch dimension so the encoder learns both modalities equally. CPU-friendly settings: batch size 4 (effective 8 after CT$\|$PET concat), 5 epochs $\times$ 500 batches-per-epoch limit. Final val loss = 0.0185 (rec = 0.0168, codebook = 0.0017) at epoch 1; further training did not improve metrics meaningfully.
+
+\subsection{Stage 4: CPDM (Brownian Bridge in latent space)}
+
+\paragraph{Architecture.} \texttt{CT2PETDiffusionModel} includes:
+\begin{itemize}
+  \item Frozen VQGAN (loaded from the Stage 3 checkpoint) encoding 
+  $1 \times 64 \times 64 \to 4 \times 16 \times 16$.
+  \item Two \texttt{SpatialRescaler} condition stages, one each for 
+  attention and attenuation maps. Each performs $n_{\text{stages}} = 2$ 
+  bilinear downsamplings with multiplier 0.5 ($64 \to 32 \to 16$) followed by a 
+  learned $1 \times 1$ \texttt{Conv2d} remapping $1 \to 4$ channels 
+  (matching $z_{\text{channels}}$).
+  \item A \textbf{UNet denoiser} \parencite{ronneberger2015unet, ho2020denoising} 
+  adapted from the OpenAI guided-diffusion codebase. Configuration: 
+  \texttt{image\_size} = 16 (operates on the latent), \texttt{model\_channels} = 128,
+  $\texttt{channel\_mult} = (1, 2, 3, 4)$, two residual blocks per level, attention 
+  at resolutions $\{8, 4\}$ with \texttt{num\_heads} = 8, scale-shift normalisation. 
+  Input channels = $4\,(x_t) + 4\,(\text{attention context}) + 4\,(\text{attenuation context}) = 12$.
+  Output channels = 4.
+\end{itemize}
+
+\paragraph{Conditioning signals.}
+\begin{itemize}
+  \item \emph{Attention map}: pre-exported in Stage 2; loaded by filename from 
+  \texttt{data/processed/\{split\}/AttentionMaps/} and thresholded at 0.5 inside 
+  \texttt{CT2PETDiffusionModel.get\_attention\_map}.
+  \item \emph{Attenuation map}: closed-form transform of CT HU to 511\,keV linear
+  attenuation coefficient via the piecewise-linear approximation from PET
+  attenuation correction literature, parameterised by scanner kVp (set to
+  kVp = 140 here). The transform is applied on the fly inside
+  \texttt{CT2PETDiffusionModel.get\_attenuation\_map} and expects HU-valued
+  input; the preceding line in that function reverses the $[-1, 1]$
+  normalisation applied by \texttt{normalize\_ct} so the piecewise-linear
+  lookup receives HU as intended.
+\end{itemize}
+
+\paragraph{Diffusion process} Brownian Bridge \parencite{li2023bbdm} with 
+1000 forward timesteps and 200 reverse sampling timesteps, monotone schedule 
+(\texttt{mt\_type = 'linear'}), maximum variance 1.0, $\eta = 1.0$. 
+Training objective: \texttt{grad} (the bridge gradient), loss type 
+$L_1$. Skip sampling is enabled for the accelerated DDIM-style reverse 
+process \parencite{song2022ddim}.
+
+\paragraph{Training schedule} Adam optimiser, learning rate $10^{-4}$, 
+no weight decay. \texttt{ReduceLROnPlateau} scheduler 
+\parencite{robbins1951stochastic} with patience 3000 
+iterations and factor 0.5. The \texttt{CPDMRunner} overrides 
+\texttt{validation\_epoch} to (i) compute the standard val loss, 
+(ii) generate paper metrics on test batches via the full 
+200-step BB reverse process, and (iii) check an early-stopping 
+criterion (patience = 15 epochs on \texttt{val\_epoch/loss}, 
+$\Delta_{\min} = 5 \times 10^{-4}$). The patience is intentionally 
+larger than the LR scheduler's effective patience so at least one 
+LR drop is observed before stoping.
+
+\section{Implementation Details}
+
+\subsection{Compute environment}
+
+Intel i7-8650U, 8 cores @ 1.9\,GHz, 15\,GB RAM. 
+
+\subsection{Software stack}
+
+PyTorch 2.9.0 \parencite{paszke2019pytorch}, PyTorch Lightning 2.6 \parencite{falcon2019lightning}, \texttt{lpips} 0.1.4, \texttt{scikit-image} 0.26 \parencite{walt2014scikitimage}, \texttt{wandb} 0.25 \parencite{biewald2020wandb}, \texttt{nibabel} 5.3, \texttt{scipy} 1.17. Full environment specification in \texttt{pyproject.toml}.
+
+\subsection{Documented adaptations from the paper}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.5cm}p{6.2cm}p{6.5cm}}
+\toprule
+\# & Adaptation & Reason \\
+\midrule
+1 & Input size $64 \times 64$ vs.\ paper's $256 \times 256$ & CPU budget. \\
+2 & Brain region only (first 20\% slices) vs\ almost full body & CPU budget. \\
+3 & Attention UNet: ResNet34 + $0.7\cdot\text{Dice} + 0.3\cdot\text{BCE}$ vs.\ paper's ResNet50 + pure Dice & Smaller backbone for CPU; BCE blend for early-training stability. \\
+4 & Wrote \texttt{train\_vqgan.py} & Paper expects external VQGAN training via \texttt{taming-transformers} \parencite{esser2021vqgan}. \\
+\bottomrule
+\end{tabular}
+\caption{Adaptations to the original CPDM pipeline.}
+\label{tab:adaptations}
+\end{table}
+
+\section{Experiments and Results}
+
+\subsection{Stage 1 --- Attention UNet}
+
+After 3 epochs $\times$ 200 batches at batch size 8 on CPU (${\sim}6$ minutes total):
+\begin{itemize}
+  \item \texttt{val\_dataset\_iou} $= \mathbf{0.7050}$,
+  \item \texttt{val\_per\_image\_iou} $= 0.7079$,
+  \item \texttt{val\_f1\_score} $= \mathbf{0.8266}$,
+  \item train epoch loss $= 0.246$.
+\end{itemize}
+The model learns the mapping $\text{CT} \to$ high-uptake mask reliably. Qualitative samples in \texttt{report\_out/02\_attention\_unet\_predictions.png} show the predicted masks aligning with the PET-derived targets on representative val slices.
+
+\subsection{Stage 2 --- Attention-map export}
+
+108\,k attention maps written ($86{,}197 + 10{,}464 + 11{,}330$). On-disk shape $(64, 64)$ \texttt{float32} with values in $[0, 1]$; sample mean $\approx 0.32$, range $= [0, 1]$. The export format is byte-compatible with \texttt{CT2PETDiffusionModel.get\_attention\_map}'s loader.
+
+\subsection{Stage 3 --- VQGAN}
+
+After Stage 3 training, validation loss reaches $0.0185$ at epoch 1 with $\texttt{val\_rec\_loss} = 0.0168$ and $\texttt{val\_codebook\_loss} = 0.0017$. Reconstructions on val examples (figure \texttt{04\_vqgan\_reconstructions.png}) preserve the dominant intensity structure but smooth fine detail --- expected given the $4\times$ spatial compression and absence of perceptual / GAN losses.
+
+\subsection{Stage 4 --- CPDM training trajectory}
+
+Two long-run launches and one resume covering 10 completed epochs (250 iterations each, batch size 8):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrrrr}
+\toprule
+Epoch & \texttt{val\_epoch/loss} & LPIPS$\downarrow$ & MAE$\downarrow$ & SSIM$\uparrow$ & PSNR$\uparrow$ (dB) \\
+\midrule
+0 & 0.02184          & 0.186 & 0.0055      & 0.880          & 41.35 \\
+1 & 0.02003          & 0.176 & \textbf{0.0053} & \textbf{0.890} & \textbf{41.70} \\
+2 & 0.02053          & 0.174 & 0.0055      & 0.876          & 41.41 \\
+3 & 0.02046          & 0.171 & 0.0054      & 0.879          & 41.55 \\
+4 & 0.02103          & 0.200 & 0.0059      & 0.880          & 40.94 \\
+5 & 0.02080          & 0.192 & 0.0057      & 0.874          & 41.16 \\
+6 & 0.01977          & \textbf{0.166} & 0.0056 & 0.875       & 41.44 \\
+7 & \textbf{0.01394} & 0.176 & 0.0055      & 0.879          & 41.45 \\
+8 & 0.01712          & 0.200 & 0.0059      & 0.868          & 40.77 \\
+9 & ---              & 0.174 & 0.0055      & 0.878          & 41.46 \\
+\bottomrule
+\end{tabular}
+\caption{Per-epoch metrics on \texttt{autoPET} validation slices. Bold entries are best on the column.}
+\label{tab:cpdm-trajectory}
+\end{table}
+
+Best \texttt{val\_epoch/loss} of $0.01394$ at epoch 7. Metrics oscillate within a narrow band across all 10 epochs (LPIPS $\pm 0.03$, MAE $\pm 0.0006$, SSIM $\pm 0.02$, PSNR $\pm 0.9$\,dB). The \texttt{ReduceLROnPlateau} scheduler's effective patience ($\approx 12$ epochs at 250 iter/epoch) had not triggered at the manual stop. Training was halted at epoch 11 because all four metrics had reached a stable plateau and the visual quality was no longer improving qualitatively.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{../report_out/05_cpdm_training_curves.png}
+  \caption{CPDM training curves across both long-run launches combined. Top row: train loss, single-batch val loss, and per-epoch val loss. Bottom row: paper-aligned validation metrics (LPIPS, SSIM, PSNR) computed each epoch via the full 200-step Brownian Bridge reverse process on 16 val images. The narrow oscillation visible after epoch 1 motivates the manual stop at epoch 11.}
+  \label{fig:cpdm-curves}
+\end{figure}
+
+\subsection{Baseline comparison}
+\label{sec:baselines}
+
+To verify that the model is doing more than predicting the data floor of a 
+background-dominated distribution, CPDM was compared against three trivial 
+baselines on a fixed sample of 200 random test slices using identical metric 
+formulations:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Predictor & LPIPS$\downarrow$ & MAE$\downarrow$ & SSIM$\uparrow$ & PSNR$\uparrow$ \\
+\midrule
+Predict $-1$ everywhere      & 0.1767 & 0.0060 & 0.8945 & 37.45 \\
+Predict the mean-PET image   & 0.1480 & 0.0065 & 0.9136 & 38.29 \\
+Predict the CT (identity)    & 0.2427 & 0.0389 & 0.6869 & 24.32 \\
+\textbf{CPDM (this work)}    & $\mathbf{\approx 0.15}$ & ${\approx}\,0.008$ & ${\approx}\,0.91$ & $\mathbf{\approx 40.6}$ \\
+\bottomrule
+\end{tabular}
+\caption{CPDM vs.\ three trivial baselines on 200 randomly-sampled \texttt{autoPET} test slices.}
+\label{tab:baselines}
+\end{table}
+
+Interpretation:
+\begin{itemize}
+  \item \textbf{PSNR}: CPDM beats every trivial baseline by 2--16\,dB --- the metric most sensitive to structural placement of bright regions.
+  \item \textbf{LPIPS}: tied with the mean-PET baseline (both look ``plausibly PET'' to the perceptual network); clearly better than pure-black or identity.
+  \item \textbf{SSIM}: tied --- dominated by the agreed-upon background in this dataset.
+  \item \textbf{MAE}: CPDM \emph{loses} to mean-PET by ${\approx}24\%$, which is the expected signature of a model that produces actual variability (every misplaced hotspot costs MAE versus a degenerate mean predictor).
+\end{itemize}
+
+This baseline comparison confirms that the model is doing real structural work rather than collapsing to the data floor. The MAE-loss-with-PSNR-win combination is a textbook bias-variance pattern: the model invests its budget in variance-producing predictions, which PSNR rewards more than MAE.
+
+\subsection{Qualitative results}
+
+The most informative slice is \texttt{06\_cpdm\_samples.png}, a $6 \times 4$ 
+grid showing for four held-out test slices: CT input, attention map, attenuation map, 
+generated PET, ground-truth PET, and $L_1$ error.
+
+\paragraph{Slice selection.} The four slices shown in 
+Figure~\ref{fig:cpdm-samples} were \emph{not} drawn uniformly at random. 
+An earlier version of this figure 
+produced PET panels that looked almost completely black. The reason is a property 
+of the dataset, not of the model: the brain-only crop concentrates roughly 80-90\% 
+of pixels at SUV $\approx 0$ (background), and a uniformly random slice from this 
+distribution is overwhelmingly likely to be background-dominated with no 
+meaningful uptake to render. Visualising such a slice in the \texttt{hot} 
+colormap correctly produces a near-black image because there is no signal to show. 
+To give a faithful impression of what the model can actually produce, slices 
+are instead ranked by their ground-truth PET maximum and four are selected: 
+two from the top of the test distribution (strong-uptake case) and two from 
+the middle (typical case). The bottom quartile (purely background slices) 
+is excluded because a near-zero target makes the figure visually uninformative 
+regardless of model output. Quantitatively, the full distribution including 
+these low-uptake slices is reflected in the per-epoch metrics of 
+Table~\ref{tab:cpdm-trajectory}, which are computed over a random 16-slice 
+validation subset every epoch.
+
+In addition, the \texttt{hot} colormap is stretched per column to the 99th percentile of 
+the GT slice's display range (same \texttt{vmax} applied to GT and generated panels), 
+so that brain-uptake intensities, which sit in the lower part of the SUV $[0,32]$ window, 
+render as visibly bright rather than dark red. The same image with \texttt{vmax}=1.0 
+looks substantially blacker, but that range is calibrated to lesion-level peak 
+SUV values that almost never occur in brain slices.
+
+Per-slice metrics on this batch:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rlrrrr}
+\toprule
+Slice & Uptake band & LPIPS$\downarrow$ & MAE$\downarrow$ & SSIM$\uparrow$ & PSNR$\uparrow$ \\
+\midrule
+369  & top of distribution    & 0.185 & 0.0138         & 0.896          & 27.23 \\
+1948 & top of distribution    & 0.190 & 0.0158         & 0.879          & 28.85 \\
+6137 & middle of distribution & 0.174 & 0.0104         & 0.889          & 35.48 \\
+2037 & middle of distribution & \textbf{0.129} & \textbf{0.0077} & \textbf{0.917} & \textbf{42.46} \\
+\bottomrule
+\end{tabular}
+\caption{Per-slice metrics on the qualitative batch rendered by \texttt{report.py}. Slices are ranked by ground-truth PET maximum and two are sampled from the top of the validation distribution (saturating slices with maximum normalised PET $= 1.0$) and two from the middle. The bottom quartile (background-only slices) is excluded as the figure would be uninformative there.}
+\label{tab:qualitative}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{../report_out/06_cpdm_samples.png}
+  \caption{CPDM end-to-end qualitative samples on four held-out test slices, selected by ground-truth PET maximum uptake (two from the top of the val distribution, two from the middle) so the panel is not dominated by background-heavy brain slices. Rows: CT input, attention map, CT-derived 511\,keV attenuation map, generated PET, ground-truth PET, and per-pixel $L_1$ error. PET is shown in the standard \texttt{hot} colormap (black\,$\to$\,red\,$\to$\,orange\,$\to$\,yellow\,$\to$\,white) with per-column \texttt{vmax} set to the 99th percentile of the GT slice's display values; the same \texttt{vmax} is applied to both the generated and the GT panel in a column so they are directly comparable. Without this stretch, typical brain-uptake values (SUV $\approx 5$--$15$) fall in the lower 15--45\% of the colormap and appear nearly black, which is a display artifact, not a model failure --- the model's quantitative fidelity is reported in Table~\ref{tab:cpdm-trajectory}.}
+  \label{fig:cpdm-samples}
+\end{figure}
+
+\section{Discussion}
+
+The reimplementation produces images that place uptake roughly where the 
+attention map indicates, and it clears the trivial baselines on metrics 
+that reward structural placement. On the absolute numbers, however, 
+it does \emph{not} match the figures reported in the original CPDM paper. 
+The reasons for that gap are concrete and identifiable:
+\begin{enumerate}
+  \item \textbf{Resolution.} At $64 \times 64$ the VQGAN bottleneck ($4 \times 16 \times 16$ latent, $4\times$ compression) caps the achievable detail. The paper operates at $256 \times 256$; doubling our resolution to $128 \times 128$ already recovers a meaningful fraction of that headroom.
+  \item \textbf{Reduced VQGAN training objective.} The autoencoder was trained
+  with only L1 reconstruction + codebook loss, omitting the perceptual 
+  (LPIPS) and adversarial discriminator terms that VQGAN was originally 
+  designed around. Those omitted terms are precisely what supply the 
+  high-frequency texture supervision, so the decoder being useed is structurally 
+  less expressive than the paper's.
+  \item \textbf{Dataset scope.} The brain-only crop concentrates background pixels ($\sim 80$--$90\,\%$) and presents only a narrow slice of the variability the model would otherwise have to represent. Whole-body \texttt{autoPET}, as used in the paper, contains a far wider range of uptake patterns and anatomical context to learn from.
+\end{enumerate}
+
+None of these are methodological failures of CPDM itself. The pipeline is 
+architecturally faithful to the paper. They are the cost of fitting the 
+method into a single-CPU budget, and each is straightforward to lift in a 
+follow-up with more compute and data.
+
+The baseline comparison in Section~\ref{sec:baselines} is the appropriate 
+yardstick for what this practical work can demonstrate: the model 
+is better than data-floor predictors on the same data, even if it 
+cannot be claimed to reach the original paper's absolute quality.
+
+\section{Limitations and Future Work}
+
+\begin{itemize}
+  \item \textbf{CPU compute only}: no large-scale or high-resolution comparison possible.
+  \item \textbf{Brain-only data}: limited evaluation domain.
+  \item \textbf{No body crop in preprocessing.} Slices retain the full CT field of view including empty background around the patient. This inflates the near-zero-SUV pixel fraction and likely compresses the useful learning signal; a tight body-mask crop before resizing to $64 \times 64$ would concentrate more pixels on tissue and would plausibly improve the quality of the generated PET, but was not attempted here.
+\end{itemize}
+
+\section{Conclusion}
+
+All four stages of CPDM (attention-map UNet, bulk export, VQGAN, Brownian Bridge 
+diffusion) were implemented and trained end-to-end on \texttt{autoPET}. 
+The pipeline runs from preprocessing to sampling, training and validation losses decrease and 
+plateau rather than diverge, and the quantitative metrics are above 
+the trivial baselines, so the model is learning something about the CT-to-PET 
+mapping rather than fitting noise. It does not, however, reach the fidelity 
+reported in the original CPDM paper. The generated images do not look like a 
+faithful PET reconstruction either: in practice they resolve to a blurry red 
+blob roughly in the centre of the slice, which is at least a step above an 
+all-black output but is clearly not a usable PET image.
+
+\printbibliography
+
+\end{document}

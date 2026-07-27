@@ -6,6 +6,8 @@ Saved as float32 sigmoid probabilities in [0, 1], shape (64, 64), matching
 the layout that BrainSliceDataset / the CPDM pipeline expect.
 """
 
+import sys as _sys, pathlib as _pathlib  # repo-root bootstrap (script moved into a subfolder)
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 import argparse
 import os
 from pathlib import Path
@@ -15,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from train_attention_map import UNetAttentionMapModel
+from training.train_attention_map import UNetAttentionMapModel
 
 
 class CTSliceDataset(Dataset):
@@ -33,9 +35,10 @@ class CTSliceDataset(Dataset):
         return ct, name
 
 
-def export_split(model, data_root: Path, split: str, batch_size: int, num_workers: int):
+def export_split(model, data_root: Path, split: str, batch_size: int, num_workers: int,
+                 out_dir_name: str = 'AttentionMaps'):
     ct_dir = data_root / split / 'CT'
-    out_dir = data_root / split / 'AttentionMaps'
+    out_dir = data_root / split / out_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = CTSliceDataset(ct_dir)
@@ -67,6 +70,9 @@ def main():
     parser.add_argument('--splits', type=str, nargs='+', default=['train', 'val', 'test'])
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--out-dir-name', type=str, default='AttentionMaps',
+                        help="subfolder under each split to write maps into "
+                             "(use a new name to preserve existing maps)")
     args = parser.parse_args()
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) - args.num_workers))
@@ -78,7 +84,7 @@ def main():
 
     data_root = Path(args.data_root)
     for split in args.splits:
-        export_split(model, data_root, split, args.batch_size, args.num_workers)
+        export_split(model, data_root, split, args.batch_size, args.num_workers, args.out_dir_name)
 
     print('Done.')
 

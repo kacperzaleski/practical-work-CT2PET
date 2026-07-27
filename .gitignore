@@ -8,3 +8,28 @@ CLAUDE.md
 /logs
 /__pycache__
 **/__pycache__/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bbl-SAVE-ERROR
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+thesis/Thesis.pdf
+practical_work/Protocol.pdf
+
+# Generated report output
+/report_out
+
+# Third-party reference papers / large binary deliverables
+Flow Based Generation.pdf
+practical_work/26SS_12215861_Kacper_Zaleski_Practical_Work_Report_BSc_CPDM_v1.pdf

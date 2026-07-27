@@ -1,0 +1,79 @@
+# UNet Attention Map Segmentation — 64x64 head+torso, background-cropped variant.
+# Same model as the legacy 64 config; only the paths (separate _fb64 folders so
+# the brain-64 and 128 attention ckpts/maps are all preserved) and wandb name
+# differ. Run with:
+#   train_attention_map.py --config <this> --data-root data/processed_fullbody --image-size 64
+
+data:
+  dataset_name: 'CT2PET_autoPET_fullbody'
+  dataset_type: 'custom_aligned'
+  dataset_config:
+    data_root: '/home/kacperzaleski/Projects/practical-work-CT2PET/data/processed_fullbody'
+    ct_max: 3071
+    pet_max: 32
+    image_size: 64
+    channels: 1
+    target_image_size: 64
+    to_normal: True
+    flip: True
+
+  train:
+    batch_size: 32
+    shuffle: True
+    num_workers: 4
+  val:
+    batch_size: 32
+    shuffle: False
+    num_workers: 2
+  test:
+    batch_size: 32
+    shuffle: False
+    num_workers: 2
+
+model:
+  AttentionMapSegmentation:
+    model_type: UNet
+    in_channels: 1
+    out_channels: 1
+    features: [64, 128, 256, 512]
+    dropout_rate: 0.1
+    use_batch_norm: True
+    loss_type: dice
+    loss_weight: 1.0
+
+  model_name: AttentionMapSegmentation
+  model_type: UNetSegmentation
+
+runner: SegmentationRunner
+
+training:
+  accumulate_grad_batches: 1
+  n_epochs: 50
+  n_steps: 50000
+  sample_interval: 2
+  save_interval: 2
+  validation_interval: 2
+  log_interval: 100
+  use_amp: False
+  grad_clip: 1.0
+  lr: 0.001
+  lr_scheduler: CosineAnnealingLR
+  warmup_epochs: 5
+
+testing:
+  metrics:
+    - dice
+    - iou
+    - accuracy
+
+paths:
+  results_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/results/AttentionMap_fb64'
+  checkpoint_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/checkpoints/AttentionMap_fb64'
+  log_dir: '/home/kacperzaleski/Projects/practical-work-CT2PET/logs/AttentionMap_fb64'
+
+wandb:
+  project: 'CT2PET-AttentionMap'
+  entity: null
+  name: 'UNet-AttentionMap-AutoPET-64-headtorso-cropped'
+  notes: 'UNet attention-map training at 64 (head+torso, background-cropped) for the CPDM fb64 run'
+  log_frequency: 100

@@ -3,6 +3,8 @@ Train UNet for attention map generation from CT images.
 Uses PyTorch Lightning with W&B logging.
 """
 
+import sys as _sys, pathlib as _pathlib  # repo-root bootstrap (script moved into a subfolder)
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 import os
 import torch
 import pytorch_lightning as pl
@@ -179,6 +181,8 @@ def main():
                        help='Path to config file')
     parser.add_argument('--data-root', type=str, default='data/processed',
                        help='Path to processed data')
+    parser.add_argument('--image-size', type=int, default=64,
+                       help='Square slice size (use 128 for the head+torso CPDM run)')
     parser.add_argument('--batch-size', type=int, default=32,
                        help='Batch size')
     parser.add_argument('--num-workers', type=int, default=4,
@@ -230,8 +234,8 @@ def main():
     print(f"Creating datasets from: {args.data_root}")
     
     # Create datasets
-    train_dataset = AttentionMapDataset(args.data_root, split='train', image_size=64, flip=True)
-    val_dataset = AttentionMapDataset(args.data_root, split='val', image_size=64, flip=False)
+    train_dataset = AttentionMapDataset(args.data_root, split='train', image_size=args.image_size, flip=True)
+    val_dataset = AttentionMapDataset(args.data_root, split='val', image_size=args.image_size, flip=False)
     
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size: {len(val_dataset)}")
@@ -326,7 +330,7 @@ def main():
     print(f"Encoder: ResNet34")
     print(f"Input channels: 1")
     print(f"Output channels: 1")
-    print(f"Image size: 64x64")
+    print(f"Image size: {args.image_size}x{args.image_size}")
     
     # Train
     print(f"\nStarting training...")

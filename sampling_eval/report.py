@@ -54,8 +54,8 @@ sys.path.insert(0, str(PROJ))
 from utils import dict2namespace
 from datasets.AttentionMapDataset import AttentionMapDataset
 from datasets.CT2PETAlignedDataset import CT2PETAlignedDataset
-from train_attention_map import UNetAttentionMapModel
-from train_vqgan import VQGANLightning
+from training.train_attention_map import UNetAttentionMapModel
+from training.train_vqgan import VQGANLightning
 from model.BrownianBridge.CT2PETDiffusionModel import CT2PETDiffusionModel
 
 DEVICE = torch.device('cpu')
@@ -402,8 +402,26 @@ print(f'CPDM trainable params: '
       f"total: {sum(p.numel() for p in cpdm.parameters()) / 1e6:.2f} M")
 
 # %%
-# Gather a fixed batch of 4 val slices.
-sample_indices = [10, 250, 1000, 5000]
+# Pick four val slices by ground-truth PET uptake (max SUV after normalization)
+# so the qualitative panel actually shows something — random indexing over a
+# brain-only split lands in mostly-background slices. Two high-uptake, two mid.
+SCORES_CACHE = OUT / 'val_pet_max_scores.npy'
+if SCORES_CACHE.exists():
+    scores = np.load(SCORES_CACHE)
+else:
+    print('Scoring val slices by max PET (one-time pass)…')
+    scores = np.empty(len(val_ds), dtype=np.float32)
+    for i in range(len(val_ds)):
+        (pet_i, _), _ = val_ds[i]
+        scores[i] = float(pet_i.max())
+    np.save(SCORES_CACHE, scores)
+order = np.argsort(scores)
+n_val = len(order)
+sample_indices = [int(order[-5]), int(order[-50]),
+                  int(order[n_val // 2]), int(order[n_val // 4])]
+print(f'Selected slice indices (by GT PET max): {sample_indices}  '
+      f'max-SUV-norm = {[float(scores[i]) for i in sample_indices]}')
+
 pet_list, ct_list, name_list = [], [], []
 for i in sample_indices:
     (pet, name), (ct, _) = val_ds[i]
@@ -433,18 +451,27 @@ ncols = len(sample_indices)
 fig, axes = plt.subplots(6, ncols, figsize=(2.4 * ncols, 14))
 row_titles = ['CT', 'attention', 'attenuation', 'generated PET', 'GT PET', 'L1 error']
 for j in range(ncols):
+    gt_disp  = to_disp(x_pet[j])
+    gen_disp = to_disp(samples[j])
+    # Stretch the hot colormap to the GT's 99th-percentile so brain-uptake
+    # regions (typical SUV 5-15, display 0.16-0.47) actually render bright
+    # instead of getting crushed against vmax=1 reserved for SUV=32. Same vmax
+    # applied to GT and generated so the two are visually comparable.
+    vmax_j = max(float(np.percentile(gt_disp, 99)), 0.20)
     axes[0, j].imshow(to_disp(x_ct[j]),  cmap='gray', vmin=0, vmax=1)
     axes[1, j].imshow(add_cond[j, 0].cpu().numpy(), cmap='magma', vmin=0, vmax=1)
     axes[2, j].imshow(add_cond[j, 1].cpu().numpy(), cmap='viridis')
-    axes[3, j].imshow(to_disp(samples[j]), cmap='hot', vmin=0, vmax=1)
-    axes[4, j].imshow(to_disp(x_pet[j]),   cmap='hot', vmin=0, vmax=1)
+    axes[3, j].imshow(gen_disp, cmap='hot', vmin=0, vmax=vmax_j)
+    axes[4, j].imshow(gt_disp,  cmap='hot', vmin=0, vmax=vmax_j)
     axes[5, j].imshow(err[j, 0].cpu().numpy(), cmap='Reds', vmin=0, vmax=0.4)
-    axes[0, j].set_title(f'slice {sample_indices[j]}', fontsize=9)
+    axes[0, j].set_title(f'slice {sample_indices[j]} (vmax={vmax_j:.2f})', fontsize=9)
 for i, t in enumerate(row_titles):
     axes[i, 0].set_ylabel(t, fontsize=11)
 for ax in axes.flat:
     ax.set_xticks([]); ax.set_yticks([])
-fig.suptitle('CPDM end-to-end: CT → (attention, attenuation) → generated PET vs ground truth', fontsize=11)
+fig.suptitle('CPDM end-to-end: CT → (attention, attenuation) → generated PET vs ground truth\n'
+             '(PET shown in hot colormap, per-column vmax = 99th percentile of GT)',
+             fontsize=11)
 fig.tight_layout()
 fig.savefig(OUT / '06_cpdm_samples.png', dpi=140, bbox_inches='tight')
 plt.show()
